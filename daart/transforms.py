@@ -4,6 +4,7 @@ Data generator objects can apply these transforms to data upon loading.
 """
 
 import numpy as np
+import torch
 
 
 class Compose(object):
@@ -114,7 +115,7 @@ class MakeOneHot(Transform):
     def __init__(self):
         pass
 
-    def __call__(self, sample):
+    def __call__(self, sample, n_classes=0):
         """Assumes that K classes are identified by the numbers 0:K-1.
 
         Parameters
@@ -129,11 +130,21 @@ class MakeOneHot(Transform):
 
         """
         if len(sample.shape) == 2:  # weak test for if sample is already onehot
-            onehot = sample
+            return sample
+        
+       
+        n_time = len(sample)
+        if n_classes == 0:
+            n_classes = int(np.nanmax(sample)) + 1
+            
+        if torch.is_tensor(sample): 
+            onehot = torch.zeros((n_time, n_classes))
+            if not any(torch.isnan(sample)):
+                onehot[torch.arange(n_time), sample.long()] = 1
+            else:
+                onehot[:] = np.nan
         else:
-            n_time = len(sample)
-            n_classes = int(np.nanmax(sample))
-            onehot = np.zeros((n_time, n_classes + 1))
+            onehot = np.zeros((n_time, n_classes))
             if not any(np.isnan(sample)):
                 onehot[np.arange(n_time), sample.astype('int')] = 1
             else:
