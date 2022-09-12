@@ -66,6 +66,9 @@ def train_model(hparams):
     if hparams['model_class'].lower() == 'segmenter':
         from daart.models import Segmenter
         model = Segmenter(hparams)
+    elif hparams['model_class'].lower() == 'gmdgm':
+        from daart.models import GMDGM
+        model = GMDGM(hparams)
     else:
         raise NotImplementedError
     model.to(hparams['device'])

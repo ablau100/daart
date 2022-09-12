@@ -103,9 +103,9 @@ class AnnealHparam(BaseCallback):
         self.epoch_end = epoch_end
         self.val_start = val_start
         self.val_end = self.hparams[self.key]
+        self.hparams[self.key] = self.val_start
 
     def on_epoch_end(self, data_generator, model, trainer, **kwargs):
-
         if trainer.curr_epoch < self.epoch_start:
             self.hparams[self.key] = self.val_start
         elif trainer.curr_epoch > self.epoch_end:

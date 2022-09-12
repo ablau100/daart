@@ -35,7 +35,7 @@ class GMDGM(BaseModel):
             - backbone (str): 'temporal-mlp' | 'dtcn' | 'lstm' | 'gru'
             - rng_seed_model (int): random seed to control weight initialization
             - input_size (int): number of input channels
-            - output_size (int): number of classes
+            - output_size (int): number of observed classes
             - n_aug_classes (int): number of additional classes without labels
             - sequence_pad (int): padding needed to account for convolutions
             - n_hid_layers (int): hidden layers of network architecture
@@ -63,6 +63,9 @@ class GMDGM(BaseModel):
         self.class_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='mean')
         # this will turn into a log-likelihood calculation using \mu(z) as mean of normal
         # self.reconstruction_loss = nn.MSELoss(reduction='mean')
+        
+        # MSE loss for recon
+        self.recon_loss = nn.MSELoss(reduction='mean')
         
     def __str__(self):
         """Pretty print model architecture."""
@@ -144,25 +147,39 @@ class GMDGM(BaseModel):
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone'])
 
         n_total_classes = self.hparams['output_size'] + self.hparams['n_aug_classes']
+        print('total classes: ', n_total_classes)
         self.hparams['n_total_classes'] = n_total_classes
         # build label prior: p(y)
         # prior prob for observed classes: 0.5 / n_observed_classes
         # prior prob for unobserved classes: 0.5 / n_aug_classes
-        probs = 0.5 * np.ones((n_total_classes,))
-        probs[:self.hparams['output_size']] /= self.hparams['output_size']
-        probs[self.hparams['output_size']:] /= self.hparams['n_aug_classes']
-       
-        assert np.isclose([np.sum(probs)], [1])
-        #self.model['py'] = Categorical(torch.tensor(probs))      
+        probs = np.ones((n_total_classes,))
+        probs /= n_total_classes
+        
+        #probs[:self.hparams['output_size']] /= self.hparams['output_size']
+        #probs[self.hparams['output_size']:] /= self.hparams['n_aug_classes']
+        
+        # just for testing
+        epsilon = .00000001
+        
+        og_prob = ((.3-epsilon)/4)
+        new_prob = (.7/2)
+        
+        u_prob = ((1-epsilon)/6)
+        
+        #probs = [epsilon, u_prob, u_prob, u_prob, u_prob, u_prob, u_prob]#, u_prob, u_prob, u_prob, u_prob]
+        probs = [epsilon, og_prob, og_prob, new_prob, new_prob, og_prob, og_prob]
+        assert np.isclose([np.sum(np.array(probs))], [1])
+        self.hparams['py_probs'] = probs
         
         # build classifier: q(y|x)
         self.model['qy_x'] = Module(
             self.hparams, 
+           # type='decoder',
             in_size=self.hparams['input_size'], 
             hid_size=self.hparams['n_hid_units'], 
             out_size=n_total_classes)
         
-        self.hparams['qy_x_temperature'] = 1
+        self.hparams['qy_x_temperature'] = 1#torch.tensor([1]).to(device=self.hparams['device'])
         
         # build encoder: q(z|x,y)
         # for now we will concatenate x and y to infer z; perhaps in the future we
@@ -172,12 +189,14 @@ class GMDGM(BaseModel):
             in_size=n_total_classes + self.hparams['input_size'],
             hid_size=self.hparams['n_hid_units'],
             out_size=self.hparams['n_hid_units'])
+        
         self.model['qz_xy_mean'] = self._build_linear(
             global_layer_num=len(self.model['qy_x'].model), name='qz_xy_mean',
             in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
+        
         self.model['qz_xy_logvar'] = self._build_linear(
             global_layer_num=len(self.model['qy_x'].model), name='qz_xy_logvar',
-            in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
+                    in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units']) 
         
         # build latent_generator: p(z|y)
         # linear layer is essentially a lookup table of shape (n_hid_units, n_total_classes)
@@ -189,11 +208,10 @@ class GMDGM(BaseModel):
         # build decoder: p(x|z)
         self.model['decoder'] = Module(
             self.hparams, 
+            type='decoder',
             in_size=self.hparams['n_hid_units'],
             hid_size=self.hparams['n_hid_units'],
             out_size=self.hparams['input_size'])
-        
-        self.hparams['kl_weight'] = 1  # weight in front of kl term; anneal this using callback
 
     def forward(self, x, y):
         """Process input data.
@@ -224,15 +242,15 @@ class GMDGM(BaseModel):
         y_logits = self.model['qy_x'](x)
         
         # initialize and sample q(y|x) (should be a one-hot vector)
-        y_probs = nn.Softmax(dim=2)(y_logits)
+        qy_x_probs = nn.Softmax(dim=2)(y_logits)
      
-        qy_x = RelaxedOneHotCategorical(
-            temperature=self.hparams['qy_x_temperature'], probs=y_probs)
+        qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], probs=qy_x_probs)
 
         
         y_sample = qy_x.rsample()  # (n_sequences, sequence_length, n_total_classes)
         
-        y_onehot = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_total_classes']])
+        # make ground truth y into onehot
+        y_onehot = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_total_classes']], device=y_logits.device)
         for s in range(y.shape[0]):
             one_hot = MakeOneHot()(y[s], self.hparams['n_total_classes'])
             y_onehot[s] = one_hot
@@ -259,20 +277,24 @@ class GMDGM(BaseModel):
         
         # push [y, x] through encoder to get parameters of q(z|x,y)
         w = self.model['encoder'](xy)
+        
+        #mw = self.model['qz_xy_mean'][0].weight
+        #print('mw ',mw)
+        
         qz_xy_mean = self.model['qz_xy_mean'](w)
         qz_xy_logvar = self.model['qz_xy_logvar'](w)
         
 
         # init z_xy_sample 
-        z_xy_sample = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_hid_units']])
+        #z_xy_sample = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_hid_units']])
         
-        for s in range(y.shape[0]):
-            mean = qz_xy_mean[s]
-            std = qz_xy_logvar[s].exp().pow(0.5)
+#         for s in range(y.shape[0]):
+#             mean = qz_xy_mean[s]
+#             std = qz_xy_logvar[s].exp().pow(0.5)
             
-            # sample with reparam trick
-            sample = mean + torch.randn(std.shape) * std
-            z_xy_sample[s] = sample
+#             # sample with reparam trick
+        z_xy_sample = qz_xy_mean + torch.randn(qz_xy_mean.shape, device=y_logits.device) * qz_xy_logvar.exp().pow(0.5)
+#             z_xy_sample[s] = sample
 
         # push sampled z from through decoder to get reconstruction
         # this will be the mean of p(x|z)
@@ -280,8 +302,9 @@ class GMDGM(BaseModel):
         
         return {
             'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
-            'y_probs': y_probs,  # (n_sequences, sequence_length, n_classes)
+            'qy_x_probs': qy_x_probs,  # (n_sequences, sequence_length, n_classes)
             'y_sample': y_sample,  # (n_sequences, sequence_length, n_classes)
+            'y_mixed': y_mixed,  # (n_sequences, sequence_length, n_classes)
             'qz_xy_mean': qz_xy_mean,  # (n_sequences, sequence_length, embedding_dim)
             'qz_xy_logvar': qz_xy_logvar,  # (n_sequences, sequence_length, embedding_dim)
             'pz_y_mean': pz_y_mean,  # (n_sequences, sequence_length, embedding_dim)
@@ -291,7 +314,7 @@ class GMDGM(BaseModel):
         }
     
     
-    def predict_labels(self, data_generator, return_scores=False, remove_pad=True):
+    def predict_labels(self, data_generator, return_scores=False, remove_pad=True, mode='eval'):
         """
         Parameters
         ----------
@@ -310,16 +333,28 @@ class GMDGM(BaseModel):
             - 'weak_labels' (list of lists): corresponding weak labels
             - 'labels' (list of lists): corresponding labels
         """
-        self.eval()
+        if mode == 'eval':
+            self.eval()
+        elif mode == 'train':
+            self.train()
+        else:
+            raise NotImplementedError(
+                'must choose mode="eval" or mode="train", not mode="%s"' % mode)
 
         pad = self.hparams.get('sequence_pad', 0)
-
+        softmax = nn.Softmax(dim=1)
 
         # initialize outputs dict
-        keys = ['y_logits','y_probs','y_sample','qz_xy_mean','qz_xy_logvar'
+        keys = ['y_logits','qy_x_probs','y_sample','qz_xy_mean','qz_xy_logvar'
                 ,'pz_y_mean','pz_y_logvar','reconstruction']
         
         results_dict = {}
+        
+        results_dict['markers'] = [[] for _ in range(data_generator.n_datasets)]
+        for sess, dataset in enumerate(data_generator.datasets):
+                results_dict['markers'][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
+
+        
         for key in keys:
             results_dict[key] = [[] for _ in range(data_generator.n_datasets)]
 
@@ -332,20 +367,27 @@ class GMDGM(BaseModel):
         for dtype in dtypes:
             data_generator.reset_iterators(dtype)
             for i in range(data_generator.n_tot_batches[dtype]):
-                data, sess_list = data_generator.next_batch(dtype)
-                outputs_dict = self.forward(data['markers'])
+                data, sess_list = data_generator.next_batch(dtype)  
+                    
+                outputs_dict = self.forward(data['markers'], data['labels_strong'])
+               # print('data 1', data['markers'].shape)
                 # remove padding if necessary
                 if pad > 0 and remove_pad:
                     for key, val in outputs_dict.items():
                         outputs_dict[key] = val[:, pad:-pad] if val is not None else None
+                    data['markers'] = data['markers'][:, pad:-pad] 
+                    #print('data 2', data['markers'].shape)
                 # loop over sequences in batch
                 for s, sess in enumerate(sess_list):
                     batch_idx = data['batch_idx'][s].item()
+                    results_dict['markers'][sess][batch_idx] = \
+                    data['markers'][s].cpu().detach().numpy()
                     for key in keys:
                         
                         # push through log-softmax, since this is included in the loss and not model
                         results_dict[key][sess][batch_idx] = \
-                            softmax(outputs_dict[key][s]).cpu().detach().numpy()
+                        outputs_dict[key][s].cpu().detach().numpy()
+                        #softmax(outputs_dict[key][s]).cpu().detach().numpy()
                     
         return results_dict
     
@@ -368,7 +410,9 @@ class GMDGM(BaseModel):
         """
 
         # define hyperparams
+        kl_y_weight = self.hparams.get('kl_y_weight', 100)
         lambda_strong = self.hparams.get('lambda_strong', 1)
+       # print('ls: ', lambda_strong)
         kl_weight = self.hparams.get('kl_weight', 1)
 
         # index padding for convolutions
@@ -377,6 +421,13 @@ class GMDGM(BaseModel):
         # push data through model
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
+        
+        # remove labels for front and back grooming
+        print('howdy hey')
+        for i in range(labels_wpad.shape[0]):
+            labels_wpad[i][labels_wpad[i]==3] = 0
+            labels_wpad[i][labels_wpad[i]==4] = 0
+  
         outputs_dict = self.forward(markers_wpad, labels_wpad)
 
         # remove padding from supplied data
@@ -404,7 +455,8 @@ class GMDGM(BaseModel):
                 if len(val.shape) > 2:
                     outputs_dict_rs[key] = torch.reshape(val, (N, val.shape[-1]))
                 else:
-                    outputs_dict_rs[key] = torch.reshape(val, (N, -1))
+                    # when the input is (n_sequences, sequence_length), we want the output to be (n_sequences * sequence_length)
+                    outputs_dict_rs[key] = torch.reshape(val, (N, 1))
             else:
                 outputs_dict_rs[key] = val
                 
@@ -414,74 +466,87 @@ class GMDGM(BaseModel):
         # initialize loss to zero
         loss = 0
         loss_dict = {}
+        
+        # ----------------------------------------------
+        # compute kl loss between q(y|x) and p(y)
+        # ----------------------------------------------  
+        # create classifier q(y|x)
+        qy_x_probs = outputs_dict_rs['qy_x_probs']
+        qy_x = Categorical(probs=qy_x_probs)
+        
+        # create prior p(y)
+        py_probs = torch.tensor(self.hparams['py_probs']).to(device=self.hparams.get('device'))
+        py = Categorical(probs=py_probs) 
+
+        loss_y_kl = torch.mean(kl_divergence(qy_x, py), axis=0) 
+        #print('loss_y_kl w/o weight: ', loss_y_kl)
+        loss_y_kl = loss_y_kl * kl_y_weight
+        #print('loss_y_kl with weight: ', loss_y_kl)
+        loss += loss_y_kl
+  
+        loss_dict['loss_y_kl'] = loss_y_kl.item()
 
         # ----------------------------------------------
         # compute classification loss on labeled data
         # ----------------------------------------------
         if lambda_strong > 0:
-            loss_strong = self.class_loss(outputs_dict_rs['y_logits'], labels_rs)
-            loss += lambda_strong * loss_strong
+            loss_strong = self.class_loss(outputs_dict_rs['y_logits'], labels_rs) * lambda_strong
+            
+            loss += loss_strong
             # log
             loss_dict['loss_classifier'] = loss_strong.item()
+           # print('loss classifier: ', loss_strong.item())
             
         # ------------------------------------
         # compute reconstruction loss
         # ------------------------------------ 
         reconstruction = outputs_dict_rs['reconstruction']
-        if torch.isnan(outputs_dict_rs['reconstruction']).any():
-            print('nan 432')
         px_z_mean = reconstruction
         px_z_std = torch.ones_like(px_z_mean)
 
         px_z = Normal(px_z_mean, px_z_std)
         
-        loss_reconstruction = px_z.log_prob(markers_rs).sum()
+        # diff bwetween log prob of adding 1d Normals and MVN log prob
+        k = markers_rs.shape[1]
+        mvn_scalar =  (-1) * .5 * math.log(k)
+        
+        loss_reconstruction = torch.sum(px_z.log_prob(markers_rs), axis=1) 
+
+        # average over batch dim
+        loss_reconstruction = (torch.mean(loss_reconstruction, axis=0) + mvn_scalar )* (-1)
         
         loss += loss_reconstruction
         # log
         loss_dict['loss_reconstruction'] = loss_reconstruction.item()
-        print('loss recon: ', loss_reconstruction)
+       # print('loss recon: ', loss_reconstruction)
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y
         # ----------------------------------------   
-        # built MVN p(z|y)
+        # build MVN p(z|y)
         pz_y_mean = outputs_dict_rs['pz_y_mean']
         pz_y_std = outputs_dict_rs['pz_y_logvar'].exp().pow(0.5)
         pz_y = Normal(pz_y_mean, pz_y_std)
         
-        # built MVN q(z|x,y)
+        # build MVN q(z|x,y)
         qz_xy_mean = outputs_dict_rs['qz_xy_mean']
         qz_xy_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)
-        
-
         qz_xy = Normal(qz_xy_mean, qz_xy_std)
         
-        loss_kl = kl_divergence(qz_xy, pz_y).sum()
-        
-        loss -= kl_weight * loss_kl
+        # sum over latent, mean over batch (mean?)
+        #print('kl shape: ', kl_divergence(qz_xy, pz_y).shape)
+        #print('kl shape after sum: ', torch.sum(kl_divergence(qz_xy, pz_y), axis=1).shape)
+        loss_kl = torch.mean(torch.sum(kl_divergence(qz_xy, pz_y), axis=1), axis=0)
+
+        loss += kl_weight * loss_kl
         # log
         loss_dict['kl_weight'] = kl_weight
-        loss_dict['loss_kl'] = loss_kl.item()
-        print('KL weight: ', kl_weight)
-        print('loss KL (w/o weight): ', loss_kl)
+        loss_dict['loss_kl'] = loss_kl.item() * kl_weight 
+        #print('KL weight: ', kl_weight)
+       # print('loss KL (w/o weight): ', loss_kl)
             
-        # ---------------------------------------
-        # entropy loss of qy_x on unlabeled data
-        # ---------------------------------------
-        loss_unlabeled = 0
-        y_probs = outputs_dict_rs['y_probs'][~idxs_labeled]
-        loss_entropy = Categorical(y_probs).entropy()
-        
-        loss_unlabeled -= loss_entropy.sum()
-        print('entropy loss: ', loss_unlabeled)
-        
-        # log
-        loss_dict['loss_unlabeled'] = loss_unlabeled.item()
-        
-        # adding unlabeled loss to total loss
-        loss += loss_unlabeled
-        print('TOTAL LOSS: ', loss)
+
+       # print('TOTAL LOSS: ', loss)
         if accumulate_grad:
             loss.backward()
 
@@ -490,3 +555,4 @@ class GMDGM(BaseModel):
 
         return loss_dict
     
+

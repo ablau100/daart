@@ -14,3 +14,5 @@ test-tube
 torch==1.8.0
 tqdm
 typeguard
+umap-learn
+jupyter
