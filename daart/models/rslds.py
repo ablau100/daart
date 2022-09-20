@@ -1,4 +1,4 @@
-"""Base models/modules in PyTorch."""
+"""rSLDS models/modules in PyTorch."""
 
 import math
 import numpy as np
@@ -21,11 +21,9 @@ from torch.distributions.normal import Normal
 from torch.distributions.kl import kl_divergence
 
 
-
-
-class GMDGMGenerative(BaseModel):
+class RSLDSGenerative(BaseModel):
     """
-    Generative model for GMDGM
+    Generative model for rSLDS
     """
     
     def __init__(self, hparams):
@@ -42,6 +40,17 @@ class GMDGMGenerative(BaseModel):
     
     def build_model(self):
         """Construct the generative netowork using hparams."""
+        
+        """
+        Notation guide:
+        py_1 := p(y_1)
+        pz_1 := p(z_1)
+        
+        px_t := p(x_t|z_t)
+        py_t := p(y_t|y_(t-1), z_(t-1)), t > 1
+        pz_t := p(z_t|z_(t-1), y_t), t > 1
+        
+        """
 
         # select backbone network for geneative model
         if self.hparams['backbone_generative'].lower() == 'temporal-mlp':
@@ -54,11 +63,10 @@ class GMDGMGenerative(BaseModel):
             from daart.backbones.rnn import RNN as Module
         elif self.hparams['backbone_generative'].lower() == 'tgm':
             raise NotImplementedError
-            # from daart.models.tgm import TGM as Module
         else:
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
 
-        # build label prior: p(y)
+        # build label prior: p(y_1)
         probs = np.ones((self.hparams['n_total_classes'],))
         background_prob = 0.01
         probs[0] = background_prob
@@ -70,23 +78,34 @@ class GMDGMGenerative(BaseModel):
                 probs[i] = (1-background_prob) * .7 * (1/len(new_classes_indexes))
             elif i > 0:
                 probs[i] = (1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1))
-        
-        
+
 #         probs[:self.hparams['output_size']] /= (self.hparams['output_size'] * 2)
 #         probs[self.hparams['output_size']:] /= (self.hparams['n_aug_classes'] * 2)
         print('probs', probs)
 
         assert np.isclose([np.sum(np.array(probs))], [1])
-        self.hparams['py_probs'] = probs
+        self.hparams['py_1_probs'] = probs
         
-        # build latent_generator: p(z|y)
-        # linear layer is essentially a lookup table of shape (n_hid_units, n_total_classes)
-        self.model['pz_y_mean'] = self._build_linear(
-            0, 'pz_y_mean', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
-        self.model['pz_y_logvar'] = self._build_linear(
-            0, 'pz_y_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
+        # build updated label prior: p(y_t|y_(t-1), z_(t-1)), t > 1
+        # CHECK w MATT
+        self.model['py_t_probs'] = self._build_linear(
+            0, 'py_t_probs', self.hparams['n_hid_units'], self.hparams['n_total_classes'])
         
-        # build decoder: p(x|z)
+        # build latent prior: p(z_1)
+        self.hparams['pz_1_mean'] = 0
+        self.hparams['pz_1_logvar'] = 0
+        
+        # build latent_generator: p(z_t|z_(t-1), y_t)
+        self.model['pz_t_mean'] = self._build_linear(
+            0, 'pz_t_mean', self.hparams['n_hid_units'], self.hparams['n_hid_units'])
+        
+        self.model['pz_t_logvar'] = Module(
+            self.hparams, 
+            in_size=self.hparams['n_total_classes'],
+            hid_size=self.hparams['n_hid_units'],
+            out_size=self.hparams['n_hid_units'])
+        
+        # build decoder: p(x_t|z_t)
         self.model['decoder'] = Module(
             self.hparams, 
             type='decoder',
@@ -96,54 +115,86 @@ class GMDGMGenerative(BaseModel):
         
     def __str__(self):
         """Pretty print generative model architecture."""
-
+        
         format_str = 'Generative network architecture: %s\n' % self.hparams['backbone_generative'].upper()
         format_str += '------------------------\n'
 
         if 'decoder' in self.model:
-            format_str += 'Decoder (p(x|z)):\n'
+            format_str += 'Decoder (p(x_t|z_t)):\n'
             for i, module in enumerate(self.model['decoder'].model):
                 format_str += str('    {}: {}\n'.format(i, module))
             format_str += '\n'
 
-        if 'py' in self.model:
-            format_str += 'p(y):\n'
-            for i, module in enumerate(self.model['py']):
+        if 'py_t_probs' in self.model:
+            format_str += 'p(y_t|y_(t-1), z_(t-1)):\n'
+            for i, module in enumerate(self.model['py_t_probs']):
                 format_str += str('    {}: {}\n'.format(i, module))
             format_str += '\n'
                 
-        if 'pz_y_mean' in self.model:
-            format_str += 'p(z|y) mean:\n'
-            for i, module in enumerate(self.model['pz_y_mean']):
+        if 'pz_t_mean' in self.model:
+            format_str += 'p(z_t|z_(t-1), y_t) mean:\n'
+            for i, module in enumerate(self.model['pz_t_mean']):
                 format_str += str('    {}: {}\n'.format(i, module))
                 
-        if 'pz_y_logvar' in self.model:
-            format_str += 'p(z|y) logvar:\n'
-            for i, module in enumerate(self.model['pz_y_logvar']):
+        if 'pz_t_logvar' in self.model:
+            format_str += 'p(z_t|z_(t-1), y_t) logvar:\n'
+            for i, module in enumerate(self.model['pz_t_logvar']):
                 format_str += str('    {}: {}\n'.format(i, module))
 
         return format_str
     
-    def forward(self, x, y, **kwargs): 
+    def forward(self, **kwargs): 
+                
+        z_input = kwargs['z_sample']
+        y_input = kwargs['y_sample']
+        y_dim = self.hparams['n_total_classes']
         
-        # push y through generative model to get parameters of p(z|y)
-        pz_y_mean = self.model['pz_y_mean'](kwargs['y_mixed'])
-
-        pz_y_logvar = self.model['pz_y_logvar'](kwargs['y_mixed'])
-
+        # reshape z to have an extra dim of length y_dim
+        z_with_y_dim = z_input.unsqueeze(2).repeat(1, 1, y_dim, 1)
+        
+        # create z_(t-1) and z_(t+1) tensors
+        z_t_skip_first = z_input[:, 1:, :]
+        z_t_skip_first_with_y_dim = z_t_skip_first.unsqueeze(2).repeat(1, 1, y_dim, 1)
+        
+        z_t_skip_last = z_input[:, :-1, :]
+        z_t_skip_last_with_y_dim = z_t_skip_last.unsqueeze(2).repeat(1, 1, y_dim, 1)
+        
+        # create y_(t-1) and y_(t+1) tensors
+        y_t_skip_first = y_input[:, 1:, :]
+        y_t_skip_last = y_input[:, :-1, :]
+        
+        # push y_(t-1) and z_(t-1) through generative model to get parameters of p(y_t|y_(t-1), z_(t-1))
+        py_t_probs = self.model['py_t_probs'](z_t_skip_last_with_y_dim)
+        
+        # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from y=0
+        py_indexer = y_t_skip_last.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_last.ndim, py_t_probs.shape[3])
+        py_t_probs = torch.gather(py_t_probs, 2, py_indexer).squeeze(2)
+        
+        # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
+        pz_t_mean = self.model['pz_t_mean'](z_t_skip_last_with_y_dim)
+        pz_t_logvar = self.model['pz_t_logvar'](y_t_skip_first)
+        
+        # index logvar by y_t - z_t starts from t=1, so our indexer y starts from y=1
+        pz_indexer = y_t_skip_first.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_first.ndim, pz_t_mean.shape[3])
+        pz_t_mean = torch.gather(pz_t_mean, 2, pz_indexer).squeeze(2)
+        
         # push sampled z from through decoder to get reconstruction
-        # this will be the mean of p(x|z)
-        x_hat = self.model['decoder'](kwargs['z_xy_sample'])
-        
+        # this will be the mean of p(x_t|z_t)
+        x_hat = self.model['decoder'](z_input)
+
         return {
-            'pz_y_mean': pz_y_mean,  # (n_sequences, sequence_length, embedding_dim)
-            'pz_y_logvar': pz_y_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'py1_probs': self.hparams['py_1_probs'], # (n_total_classes)
+            'py_t_probs': py_t_probs, # (n_sequences, sequence_length, n_total_classes)
+            'pz_t_mean': pz_t_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_t_logvar': pz_t_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_1_mean': self.hparams['pz_1_mean'],  # (embedding_dim)
+            'pz_1_logvar': self.hparams['pz_1_logvar'],  # (embedding_dim)
             'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
         }
 
 
-class GMDGM(BaseModel):
-    """Gaussian Mixture Deep Generative Model.
+class RSLDS(BaseModel):
+    """rSLDS Model.
     
     [insert arxiv link here]
     """
@@ -181,7 +232,7 @@ class GMDGM(BaseModel):
         hparams['model'] = self.model
         
         self.inference = BaseInference(hparams)
-        self.generative = GMDGMGenerative(hparams)
+        self.generative = RSLDSGenerative(hparams)
         self.build_model()
 
         # label loss based on cross entropy; don't compute gradient when target = 0
@@ -190,6 +241,10 @@ class GMDGM(BaseModel):
         
         # MSE loss for reconstruction
         self.recon_loss = nn.MSELoss(reduction='mean')
+        
+        # maybe init z sample array and y sample array here?
+        self.z_samples_array = []
+        self.y_mixed_array = []
         
     def __str__(self):
         """Pretty print model architecture."""
@@ -247,7 +302,18 @@ class GMDGM(BaseModel):
         """
         
         inf_outputs = self.inference(x, y)
-        gen_outputs = self.generative(x, y, **inf_outputs)
+        
+        # append new z sample and y mixed
+        self.z_samples_array.append(inf_outputs['z_xy_sample'])
+        self.y_mixed_array.append(inf_outputs['y_mixed'])
+        
+        # generative input
+        gen_inputs = {
+           'y_sample': inf_outputs['y_mixed'],
+           'z_sample': inf_outputs['z_xy_sample'], 
+        }
+        
+        gen_outputs = self.generative(**gen_inputs)
 
         # merge the two outputs
         output_dict = {**inf_outputs, **gen_outputs}
@@ -408,25 +474,6 @@ class GMDGM(BaseModel):
         loss_dict = {}
         
         # ----------------------------------------------
-        # compute kl loss between q(y|x) and p(y)
-        # ----------------------------------------------  
-        # create classifier q(y|x)
-        qy_x_probs = outputs_dict_rs['qy_x_probs']
-        qy_x = Categorical(probs=qy_x_probs)
-        
-        # create prior p(y)
-        py_probs = torch.tensor(self.hparams['py_probs']).to(device=self.hparams.get('device'))
-        py = Categorical(probs=py_probs) 
-
-        loss_y_kl = torch.mean(kl_divergence(qy_x, py), axis=0) 
-        #print('loss_y_kl w/o weight: ', loss_y_kl)
-        loss_y_kl = loss_y_kl * kl_y_weight
-        #print('loss_y_kl with weight: ', loss_y_kl)
-        loss += loss_y_kl
-  
-        loss_dict['loss_y_kl'] = loss_y_kl.item()
-
-        # ----------------------------------------------
         # compute classification loss on labeled data
         # ----------------------------------------------
         if lambda_strong > 0:
@@ -436,7 +483,8 @@ class GMDGM(BaseModel):
             # log
             loss_dict['loss_classifier'] = loss_strong.item()
            # print('loss classifier: ', loss_strong.item())
-            
+        
+        
         # ------------------------------------
         # compute reconstruction loss
         # ------------------------------------ 
@@ -459,6 +507,27 @@ class GMDGM(BaseModel):
         # log
         loss_dict['loss_reconstruction'] = loss_reconstruction.item()
        # print('loss recon: ', loss_reconstruction)
+    
+    
+        # ----------------------------------------------
+        # compute kl loss between q(y|x) and p(y)
+        # ----------------------------------------------  
+        # create classifier q(y|x)
+        qy_x_probs = outputs_dict_rs['qy_x_probs']
+        qy_x = Categorical(probs=qy_x_probs)
+        
+        # create prior p(y)
+        py_probs = torch.tensor(self.hparams['py_probs']).to(device=self.hparams.get('device'))
+        py = Categorical(probs=py_probs) 
+
+        loss_y_kl = torch.mean(kl_divergence(qy_x, py), axis=0) 
+        #print('loss_y_kl w/o weight: ', loss_y_kl)
+        loss_y_kl = loss_y_kl * kl_y_weight
+        #print('loss_y_kl with weight: ', loss_y_kl)
+        loss += loss_y_kl
+  
+        loss_dict['loss_y_kl'] = loss_y_kl.item()
+ 
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y

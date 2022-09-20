@@ -12,6 +12,13 @@ from torch import nn, save
 
 from daart import losses
 
+from daart.transforms import MakeOneHot
+from torch.distributions import Categorical
+from torch.distributions.relaxed_categorical import RelaxedOneHotCategorical
+from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.distributions.normal import Normal
+from torch.distributions.kl import kl_divergence
+
 # to ignore imports for sphix-autoapidoc
 __all__ = [
     'reparameterize_gaussian', 'get_activation_func_from_str', 'BaseModel', 'Segmenter',
@@ -221,3 +228,260 @@ class Ensembler(object):
                     labels[sess][batch] = labels_curr
 
         return {'labels': labels}
+    
+    
+    
+    
+class BaseInference(BaseModel):
+    """
+    Approximate posterior setup shared among models
+    """
+    
+    def __init__(self, hparams):
+        """
+        
+        Parameters
+        ----------
+        hparams : dict
+            
+        """
+        super().__init__()
+        self.hparams = hparams
+        self.model = hparams['model']
+
+    
+    def build_model(self):
+        """Construct the inference network using hparams."""
+
+        # select backbone network for inference model
+        if self.hparams['backbone_inference'].lower() == 'temporal-mlp':
+            from daart.backbones.temporalmlp import TemporalMLP as Module
+        elif self.hparams['backbone_inference'].lower() == 'tcn':
+            raise NotImplementedError('deprecated; use dtcn instead')
+        elif self.hparams['backbone_inference'].lower() == 'dtcn':
+            from daart.backbones.tcn import DilatedTCN as Module
+        elif self.hparams['backbone_inference'].lower() in ['lstm', 'gru']:
+            from daart.backbones.rnn import RNN as Module
+        elif self.hparams['backbone_inference'].lower() == 'tgm':
+            raise NotImplementedError
+        else:
+            raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_inference'])
+
+        # build classifier: q(y|x)
+        self.model['qy_x'] = Module(
+            self.hparams, 
+            type='decoder',
+            in_size=self.hparams['input_size'], 
+            hid_size=self.hparams['n_hid_units'], 
+            out_size=self.hparams['n_total_classes'])
+        
+        self.hparams['qy_x_temperature'] = 1#torch.tensor([1]).to(device=self.hparams['device'])
+        
+        # build encoder: q(z|x,y)
+        self.model['encoder'] = Module(
+            self.hparams, 
+            in_size=self.hparams['n_total_classes'] + self.hparams['input_size'],
+            hid_size=self.hparams['n_hid_units'],
+            out_size=self.hparams['n_hid_units'])
+        
+        self.model['qz_xy_mean'] = self._build_linear(
+            global_layer_num=len(self.model['qy_x'].model), name='qz_xy_mean',
+            in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
+        
+        self.model['qz_xy_logvar'] = self._build_linear(
+            global_layer_num=len(self.model['qy_x'].model), name='qz_xy_logvar',
+                    in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units']) 
+        
+    def __str__(self):
+        format_str = 'Inference network architecture: %s\n' % self.hparams['backbone_inference'].upper()
+        format_str += '------------------------\n'
+
+        format_str += 'Encoder (q(z|x,y)):\n'
+        for i, module in enumerate(self.model['encoder'].model):
+            format_str += str('    {}: {}\n'.format(i, module))
+        format_str += '\n'
+
+        if 'qy_x' in self.model:
+            format_str += 'q(y|x):\n'
+            for i, module in enumerate(self.model['qy_x'].model):
+                format_str += str('    {}: {}\n'.format(i, module))
+            format_str += '\n'
+
+        if 'qz_xy_mean' in self.model:
+            format_str += 'q(z|xy) mean:\n'
+            for i, module in enumerate(self.model['qz_xy_mean']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                
+        if 'qz_xy_logvar' in self.model:
+            format_str += 'q(z|xy) logvar:\n'
+            for i, module in enumerate(self.model['qz_xy_logvar']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                
+        return format_str
+    
+    def forward(self, x, y):
+        # push inputs through classifier to get q(y|x)
+        y_logits = self.model['qy_x'](x)
+        
+        # initialize and sample q(y|x) (should be a one-hot vector)
+        qy_x_probs = nn.Softmax(dim=2)(y_logits)
+        qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], probs=qy_x_probs)
+
+        y_sample = qy_x.rsample()  # (n_sequences, sequence_length, n_total_classes)
+        
+        # make ground truth y into onehot
+        y_onehot = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_total_classes']], device=y_logits.device)
+        for s in range(y.shape[0]):
+            one_hot = MakeOneHot()(y[s], self.hparams['n_total_classes'])
+            y_onehot[s] = one_hot
+
+        # init y_mixed, which will contain true labels for labeled data, samples for unlabled data
+        y_mixed = y_onehot.clone().detach()  # (n_sequences, sequence_length, n_total_classes)
+        # loop over sequences in batch
+        idxs_labeled = torch.zeros_like(y)
+        for s in range(y_mixed.shape[0]):
+            idxs_labeled[s] = y[s] != 0
+            y_mixed[s, ~idxs_labeled[s], :] = y_sample[s, ~idxs_labeled[s]]
+        
+        # concatenate sample with input x
+        # (n_sequences, sequence_length, n_total_classes))
+        xy = torch.cat([x, y_mixed], dim=2)
+        
+        # push [y, x] through encoder to get parameters of q(z|x,y)
+        w = self.model['encoder'](xy)
+        
+        qz_xy_mean = self.model['qz_xy_mean'](w)
+        qz_xy_logvar = self.model['qz_xy_logvar'](w)
+            
+        # sample with reparam trick
+        z_xy_sample = qz_xy_mean + torch.randn(qz_xy_mean.shape, device=y_logits.device) * qz_xy_logvar.exp().pow(0.5)
+        
+        return {
+            'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
+            'qy_x_probs': qy_x_probs,  # (n_sequences, sequence_length, n_classes)
+            'y_sample': y_sample,  # (n_sequences, sequence_length, n_classes)
+            'y_mixed': y_mixed,  # (n_sequences, sequence_length, n_classes)
+            'qz_xy_mean': qz_xy_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'qz_xy_logvar': qz_xy_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'z_xy_sample': z_xy_sample, # (n_sequences, sequence_length, embedding_dim)
+            'idxs_labeled': idxs_labeled,  # (n_sequences, sequence_length)
+        }
+    
+    
+class BaseGenerative(BaseModel):
+    """
+    Generative model template
+    """
+    
+    def __init__(self, hparams):
+        """
+        
+        Parameters
+        ----------
+        hparams : dict
+            
+        """
+        super().__init__()
+        self.hparams = hparams
+        self.model = hparams['model']
+    
+    def build_model(self):
+        """Construct the generative netowork using hparams."""
+
+        # select backbone network for geneative model
+        if self.hparams['backbone_generative'].lower() == 'temporal-mlp':
+            from daart.backbones.temporalmlp import TemporalMLP as Module
+        elif self.hparams['backbone_generative'].lower() == 'tcn':
+            raise NotImplementedError('deprecated; use dtcn instead')
+        elif self.hparams['backbone_generative'].lower() == 'dtcn':
+            from daart.backbones.tcn import DilatedTCN as Module
+        elif self.hparams['backbone_generative'].lower() in ['lstm', 'gru']:
+            from daart.backbones.rnn import RNN as Module
+        elif self.hparams['backbone_generative'].lower() == 'tgm':
+            raise NotImplementedError
+            # from daart.models.tgm import TGM as Module
+        else:
+            raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
+
+        # build label prior: p(y)
+        probs = np.ones((self.hparams['n_total_classes'],))
+        background_prob = 0.01
+        probs[0] = background_prob
+        
+        new_classes_indexes = [1,2]
+        
+        for i in range(self.hparams['n_total_classes']):
+            if i in new_classes_indexes:
+                probs[i] = (1-background_prob) * .7 * (1/len(new_classes_indexes))
+            elif i > 0:
+                probs[i] = (1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1))
+        
+        
+#         probs[:self.hparams['output_size']] /= (self.hparams['output_size'] * 2)
+#         probs[self.hparams['output_size']:] /= (self.hparams['n_aug_classes'] * 2)
+        print('probs', probs)
+
+        assert np.isclose([np.sum(np.array(probs))], [1])
+        self.hparams['py_probs'] = probs
+        
+        # build latent_generator: p(z|y)
+        # linear layer is essentially a lookup table of shape (n_hid_units, n_total_classes)
+        self.model['pz_y_mean'] = self._build_linear(
+            0, 'pz_y_mean', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
+        self.model['pz_y_logvar'] = self._build_linear(
+            0, 'pz_y_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
+        
+        # build decoder: p(x|z)
+        self.model['decoder'] = Module(
+            self.hparams, 
+            type='decoder',
+            in_size=self.hparams['n_hid_units'],
+            hid_size=self.hparams['n_hid_units'],
+            out_size=self.hparams['input_size'])
+        
+    def __str__(self):
+        """Pretty print generative model architecture."""
+
+        format_str = 'Generative network architecture: %s\n' % self.hparams['backbone_generative'].upper()
+        format_str += '------------------------\n'
+
+        if 'decoder' in self.model:
+            format_str += 'Decoder (p(x|z)):\n'
+            for i, module in enumerate(self.model['decoder'].model):
+                format_str += str('    {}: {}\n'.format(i, module))
+            format_str += '\n'
+
+        if 'py' in self.model:
+            format_str += 'p(y):\n'
+            for i, module in enumerate(self.model['py']):
+                format_str += str('    {}: {}\n'.format(i, module))
+            format_str += '\n'
+                
+        if 'pz_y_mean' in self.model:
+            format_str += 'p(z|y) mean:\n'
+            for i, module in enumerate(self.model['pz_y_mean']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                
+        if 'pz_y_logvar' in self.model:
+            format_str += 'p(z|y) logvar:\n'
+            for i, module in enumerate(self.model['pz_y_logvar']):
+                format_str += str('    {}: {}\n'.format(i, module))
+
+        return format_str
+    
+    def forward(self, x, y, **kwargs): 
+        
+        # push y through generative model to get parameters of p(z|y)
+        pz_y_mean = self.model['pz_y_mean'](kwargs['y_mixed'])
+
+        pz_y_logvar = self.model['pz_y_logvar'](kwargs['y_mixed'])
+
+        # push sampled z from through decoder to get reconstruction
+        # this will be the mean of p(x|z)
+        x_hat = self.model['decoder'](kwargs['z_xy_sample'])
+        
+        return {
+            'pz_y_mean': pz_y_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_y_logvar': pz_y_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
+        }

@@ -11,7 +11,7 @@ from sklearn.metrics import accuracy_score, r2_score
 from torch import nn, save
 
 from daart import losses
-from daart.models.base import BaseModel, BaseInference, BaseGenerative, reparameterize_gaussian, get_activation_func_from_str
+from daart.models.base import BaseModel, reparameterize_gaussian, get_activation_func_from_str
 from daart.transforms import MakeOneHot
     
 from torch.distributions import Categorical
@@ -19,128 +19,6 @@ from torch.distributions.relaxed_categorical import RelaxedOneHotCategorical
 from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.distributions.normal import Normal
 from torch.distributions.kl import kl_divergence
-
-
-
-
-class GMDGMGenerative(BaseModel):
-    """
-    Generative model for GMDGM
-    """
-    
-    def __init__(self, hparams):
-        """
-        
-        Parameters
-        ----------
-        hparams : dict
-            
-        """
-        super().__init__()
-        self.hparams = hparams
-        self.model = hparams['model']
-    
-    def build_model(self):
-        """Construct the generative netowork using hparams."""
-
-        # select backbone network for geneative model
-        if self.hparams['backbone_generative'].lower() == 'temporal-mlp':
-            from daart.backbones.temporalmlp import TemporalMLP as Module
-        elif self.hparams['backbone_generative'].lower() == 'tcn':
-            raise NotImplementedError('deprecated; use dtcn instead')
-        elif self.hparams['backbone_generative'].lower() == 'dtcn':
-            from daart.backbones.tcn import DilatedTCN as Module
-        elif self.hparams['backbone_generative'].lower() in ['lstm', 'gru']:
-            from daart.backbones.rnn import RNN as Module
-        elif self.hparams['backbone_generative'].lower() == 'tgm':
-            raise NotImplementedError
-            # from daart.models.tgm import TGM as Module
-        else:
-            raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
-
-        # build label prior: p(y)
-        probs = np.ones((self.hparams['n_total_classes'],))
-        background_prob = 0.01
-        probs[0] = background_prob
-        
-        new_classes_indexes = [1,2]
-        
-        for i in range(self.hparams['n_total_classes']):
-            if i in new_classes_indexes:
-                probs[i] = (1-background_prob) * .7 * (1/len(new_classes_indexes))
-            elif i > 0:
-                probs[i] = (1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1))
-        
-        
-#         probs[:self.hparams['output_size']] /= (self.hparams['output_size'] * 2)
-#         probs[self.hparams['output_size']:] /= (self.hparams['n_aug_classes'] * 2)
-        print('probs', probs)
-
-        assert np.isclose([np.sum(np.array(probs))], [1])
-        self.hparams['py_probs'] = probs
-        
-        # build latent_generator: p(z|y)
-        # linear layer is essentially a lookup table of shape (n_hid_units, n_total_classes)
-        self.model['pz_y_mean'] = self._build_linear(
-            0, 'pz_y_mean', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
-        self.model['pz_y_logvar'] = self._build_linear(
-            0, 'pz_y_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
-        
-        # build decoder: p(x|z)
-        self.model['decoder'] = Module(
-            self.hparams, 
-            type='decoder',
-            in_size=self.hparams['n_hid_units'],
-            hid_size=self.hparams['n_hid_units'],
-            out_size=self.hparams['input_size'])
-        
-    def __str__(self):
-        """Pretty print generative model architecture."""
-
-        format_str = 'Generative network architecture: %s\n' % self.hparams['backbone_generative'].upper()
-        format_str += '------------------------\n'
-
-        if 'decoder' in self.model:
-            format_str += 'Decoder (p(x|z)):\n'
-            for i, module in enumerate(self.model['decoder'].model):
-                format_str += str('    {}: {}\n'.format(i, module))
-            format_str += '\n'
-
-        if 'py' in self.model:
-            format_str += 'p(y):\n'
-            for i, module in enumerate(self.model['py']):
-                format_str += str('    {}: {}\n'.format(i, module))
-            format_str += '\n'
-                
-        if 'pz_y_mean' in self.model:
-            format_str += 'p(z|y) mean:\n'
-            for i, module in enumerate(self.model['pz_y_mean']):
-                format_str += str('    {}: {}\n'.format(i, module))
-                
-        if 'pz_y_logvar' in self.model:
-            format_str += 'p(z|y) logvar:\n'
-            for i, module in enumerate(self.model['pz_y_logvar']):
-                format_str += str('    {}: {}\n'.format(i, module))
-
-        return format_str
-    
-    def forward(self, x, y, **kwargs): 
-        
-        # push y through generative model to get parameters of p(z|y)
-        pz_y_mean = self.model['pz_y_mean'](kwargs['y_mixed'])
-
-        pz_y_logvar = self.model['pz_y_logvar'](kwargs['y_mixed'])
-
-        # push sampled z from through decoder to get reconstruction
-        # this will be the mean of p(x|z)
-        x_hat = self.model['decoder'](kwargs['z_xy_sample'])
-        
-        return {
-            'pz_y_mean': pz_y_mean,  # (n_sequences, sequence_length, embedding_dim)
-            'pz_y_logvar': pz_y_logvar,  # (n_sequences, sequence_length, embedding_dim)
-            'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
-        }
-
 
 class GMDGM(BaseModel):
     """Gaussian Mixture Deep Generative Model.
@@ -178,29 +56,69 @@ class GMDGM(BaseModel):
         # - latent_generator: p(z|y)
 
         self.model = nn.ModuleDict()
-        hparams['model'] = self.model
-        
-        self.inference = BaseInference(hparams)
-        self.generative = GMDGMGenerative(hparams)
         self.build_model()
 
         # label loss based on cross entropy; don't compute gradient when target = 0
         ignore_index = hparams.get('ignore_class', 0)
         self.class_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='mean')
+        # this will turn into a log-likelihood calculation using \mu(z) as mean of normal
+        # self.reconstruction_loss = nn.MSELoss(reduction='mean')
         
-        # MSE loss for reconstruction
+        # MSE loss for recon
         self.recon_loss = nn.MSELoss(reduction='mean')
         
     def __str__(self):
         """Pretty print model architecture."""
 
-        format_str = '\n\nInference model\n'
-        format_str += self.inference.__str__()
-
+        # list: encoder, decoder, qz_mean, qz_logvar, classifier,  
+        
+        # py, qy_x, encoder--, qz_xy_mean, qz_xy_logvar, 'pz_y_mean, 'pz_y_logvar, decoder--
+        
+        format_str = '\n%s architecture\n' % self.hparams['backbone'].upper()
         format_str += '------------------------\n'
 
-        format_str += '\n\nGenerative model\n'
-        format_str += self.generative.__str__()
+        format_str += 'Encoder:\n'
+        for i, module in enumerate(self.model['encoder'].model):
+            format_str += str('    {}: {}\n'.format(i, module))
+        format_str += '\n'
+
+        if 'decoder' in self.model:
+            format_str += 'Decoder:\n'
+            for i, module in enumerate(self.model['decoder'].model):
+                format_str += str('    {}: {}\n'.format(i, module))
+            format_str += '\n'
+
+        if 'py' in self.model:
+            format_str += 'p(y):\n'
+            for i, module in enumerate(self.model['py']):
+                format_str += str('    {}: {}\n'.format(i, module))
+            format_str += '\n'
+
+        if 'qy_x' in self.model:
+            format_str += 'q(y|x):\n'
+            for i, module in enumerate(self.model['qy_x'].model):
+                format_str += str('    {}: {}\n'.format(i, module))
+            format_str += '\n'
+
+        if 'qz_xy_mean' in self.model:
+            format_str += 'q(z|xy) mean:\n'
+            for i, module in enumerate(self.model['qz_xy_mean']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                
+        if 'qz_xy_logvar' in self.model:
+            format_str += 'q(z|xy) logvar:\n'
+            for i, module in enumerate(self.model['qz_xy_logvar']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                
+        if 'pz_y_mean' in self.model:
+            format_str += 'p(z|y) mean:\n'
+            for i, module in enumerate(self.model['pz_y_mean']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                
+        if 'pz_y_logvar' in self.model:
+            format_str += 'p(z|y) logvar:\n'
+            for i, module in enumerate(self.model['pz_y_logvar']):
+                format_str += str('    {}: {}\n'.format(i, module))
 
         return format_str
         
@@ -212,13 +130,88 @@ class GMDGM(BaseModel):
         rng_seed_model = self.hparams.get('rng_seed_model', 0)
         torch.manual_seed(rng_seed_model)
         np.random.seed(rng_seed_model)
-        
-        n_total_classes = self.hparams['n_observed_classes'] + self.hparams['n_aug_classes']
+
+        # select backbone network
+        if self.hparams['backbone'].lower() == 'temporal-mlp':
+            from daart.backbones.temporalmlp import TemporalMLP as Module
+        elif self.hparams['backbone'].lower() == 'tcn':
+            raise NotImplementedError('deprecated; use dtcn instead')
+        elif self.hparams['backbone'].lower() == 'dtcn':
+            from daart.backbones.tcn import DilatedTCN as Module
+        elif self.hparams['backbone'].lower() in ['lstm', 'gru']:
+            from daart.backbones.rnn import RNN as Module
+        elif self.hparams['backbone'].lower() == 'tgm':
+            raise NotImplementedError
+            # from daart.models.tgm import TGM as Module
+        else:
+            raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone'])
+
+        n_total_classes = self.hparams['output_size'] + self.hparams['n_aug_classes']
+        print('total classes: ', n_total_classes)
         self.hparams['n_total_classes'] = n_total_classes
-
-        self.inference.build_model()
-        self.generative.build_model()
-
+        # build label prior: p(y)
+        # prior prob for observed classes: 0.5 / n_observed_classes
+        # prior prob for unobserved classes: 0.5 / n_aug_classes
+        probs = np.ones((n_total_classes,))
+        probs /= n_total_classes
+        
+        #probs[:self.hparams['output_size']] /= self.hparams['output_size']
+        #probs[self.hparams['output_size']:] /= self.hparams['n_aug_classes']
+        
+        # just for testing
+        epsilon = .00000001
+        
+        og_prob = ((.3-epsilon)/4)
+        new_prob = (.7/2)
+        
+        u_prob = ((1-epsilon)/6)
+        
+        #probs = [epsilon, u_prob, u_prob, u_prob, u_prob, u_prob, u_prob]#, u_prob, u_prob, u_prob, u_prob]
+        probs = [epsilon, og_prob, og_prob, new_prob, new_prob, og_prob, og_prob]
+        assert np.isclose([np.sum(np.array(probs))], [1])
+        self.hparams['py_probs'] = probs
+        
+        # build classifier: q(y|x)
+        self.model['qy_x'] = Module(
+            self.hparams, 
+           # type='decoder',
+            in_size=self.hparams['input_size'], 
+            hid_size=self.hparams['n_hid_units'], 
+            out_size=n_total_classes)
+        
+        self.hparams['qy_x_temperature'] = 1#torch.tensor([1]).to(device=self.hparams['device'])
+        
+        # build encoder: q(z|x,y)
+        # for now we will concatenate x and y to infer z; perhaps in the future we
+        # can try a lookup table?
+        self.model['encoder'] = Module(
+            self.hparams, 
+            in_size=n_total_classes + self.hparams['input_size'],
+            hid_size=self.hparams['n_hid_units'],
+            out_size=self.hparams['n_hid_units'])
+        
+        self.model['qz_xy_mean'] = self._build_linear(
+            global_layer_num=len(self.model['qy_x'].model), name='qz_xy_mean',
+            in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
+        
+        self.model['qz_xy_logvar'] = self._build_linear(
+            global_layer_num=len(self.model['qy_x'].model), name='qz_xy_logvar',
+                    in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units']) 
+        
+        # build latent_generator: p(z|y)
+        # linear layer is essentially a lookup table of shape (n_hid_units, n_total_classes)
+        self.model['pz_y_mean'] = self._build_linear(
+            0, 'pz_y_mean', n_total_classes, self.hparams['n_hid_units'])
+        self.model['pz_y_logvar'] = self._build_linear(
+            0, 'pz_y_logvar', n_total_classes, self.hparams['n_hid_units'])
+        
+        # build decoder: p(x|z)
+        self.model['decoder'] = Module(
+            self.hparams, 
+            type='decoder',
+            in_size=self.hparams['n_hid_units'],
+            hid_size=self.hparams['n_hid_units'],
+            out_size=self.hparams['input_size'])
 
     def forward(self, x, y):
         """Process input data.
@@ -245,14 +238,80 @@ class GMDGM(BaseModel):
               shape of (n_sequences, sequence_length, n_markers)
 
         """
+        # push inputs through classifier to get q(y|x)
+        y_logits = self.model['qy_x'](x)
         
-        inf_outputs = self.inference(x, y)
-        gen_outputs = self.generative(x, y, **inf_outputs)
+        # initialize and sample q(y|x) (should be a one-hot vector)
+        qy_x_probs = nn.Softmax(dim=2)(y_logits)
+     
+        qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], probs=qy_x_probs)
 
-        # merge the two outputs
-        output_dict = {**inf_outputs, **gen_outputs}
+        
+        y_sample = qy_x.rsample()  # (n_sequences, sequence_length, n_total_classes)
+        
+        # make ground truth y into onehot
+        y_onehot = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_total_classes']], device=y_logits.device)
+        for s in range(y.shape[0]):
+            one_hot = MakeOneHot()(y[s], self.hparams['n_total_classes'])
+            y_onehot[s] = one_hot
 
-        return output_dict
+        # init y_mixed, which will contain true labels for labeled data, samples for unlabled data
+        y_mixed = y_onehot.clone().detach()  # (n_sequences, sequence_length, n_total_classes)
+        # loop over sequences in batch
+        idxs_labeled = torch.zeros_like(y)
+        for s in range(y_mixed.shape[0]):
+            # for each sequence, update y_mixed with samples when true label is 0 
+            # (i.e. no label)
+            idxs_labeled[s] = y[s] != 0
+            y_mixed[s, ~idxs_labeled[s], :] = y_sample[s, ~idxs_labeled[s]]
+        
+        # concatenate sample with input x
+        # (n_sequences, sequence_length, n_total_classes))
+        xy = torch.cat([x, y_mixed], dim=2)
+        
+        # push y through generative model to get parameters of p(z|y)
+        pz_y_mean = self.model['pz_y_mean'](y_mixed)
+
+        pz_y_logvar = self.model['pz_y_logvar'](y_mixed)
+
+        
+        # push [y, x] through encoder to get parameters of q(z|x,y)
+        w = self.model['encoder'](xy)
+        
+        #mw = self.model['qz_xy_mean'][0].weight
+        #print('mw ',mw)
+        
+        qz_xy_mean = self.model['qz_xy_mean'](w)
+        qz_xy_logvar = self.model['qz_xy_logvar'](w)
+        
+
+        # init z_xy_sample 
+        #z_xy_sample = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_hid_units']])
+        
+#         for s in range(y.shape[0]):
+#             mean = qz_xy_mean[s]
+#             std = qz_xy_logvar[s].exp().pow(0.5)
+            
+#             # sample with reparam trick
+        z_xy_sample = qz_xy_mean + torch.randn(qz_xy_mean.shape, device=y_logits.device) * qz_xy_logvar.exp().pow(0.5)
+#             z_xy_sample[s] = sample
+
+        # push sampled z from through decoder to get reconstruction
+        # this will be the mean of p(x|z)
+        x_hat = self.model['decoder'](z_xy_sample)
+        
+        return {
+            'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
+            'qy_x_probs': qy_x_probs,  # (n_sequences, sequence_length, n_classes)
+            'y_sample': y_sample,  # (n_sequences, sequence_length, n_classes)
+            'y_mixed': y_mixed,  # (n_sequences, sequence_length, n_classes)
+            'qz_xy_mean': qz_xy_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'qz_xy_logvar': qz_xy_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_y_mean': pz_y_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_y_logvar': pz_y_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
+            'idxs_labeled': idxs_labeled,  # (n_sequences, sequence_length)
+        }
     
     
     def predict_labels(self, data_generator, return_scores=False, remove_pad=True, mode='eval'):
@@ -363,10 +422,11 @@ class GMDGM(BaseModel):
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
         
-        # remove labels for walk/still
+        # remove labels for front and back grooming
+        print('howdy hey')
         for i in range(labels_wpad.shape[0]):
-            labels_wpad[i][labels_wpad[i]==1] = 0
-            labels_wpad[i][labels_wpad[i]==2] = 0
+            labels_wpad[i][labels_wpad[i]==3] = 0
+            labels_wpad[i][labels_wpad[i]==4] = 0
   
         outputs_dict = self.forward(markers_wpad, labels_wpad)
 
@@ -454,7 +514,7 @@ class GMDGM(BaseModel):
 
         # average over batch dim
         loss_reconstruction = (torch.mean(loss_reconstruction, axis=0) + mvn_scalar )* (-1)
-                              
+        
         loss += loss_reconstruction
         # log
         loss_dict['loss_reconstruction'] = loss_reconstruction.item()
@@ -474,7 +534,8 @@ class GMDGM(BaseModel):
         qz_xy = Normal(qz_xy_mean, qz_xy_std)
         
         # sum over latent, mean over batch (mean?)
-        
+        #print('kl shape: ', kl_divergence(qz_xy, pz_y).shape)
+        #print('kl shape after sum: ', torch.sum(kl_divergence(qz_xy, pz_y), axis=1).shape)
         loss_kl = torch.mean(torch.sum(kl_divergence(qz_xy, pz_y), axis=1), axis=0)
 
         loss += kl_weight * loss_kl
@@ -485,7 +546,7 @@ class GMDGM(BaseModel):
        # print('loss KL (w/o weight): ', loss_kl)
             
 
-        #print('TOTAL LOSS: ', loss)
+       # print('TOTAL LOSS: ', loss)
         if accumulate_grad:
             loss.backward()
 
