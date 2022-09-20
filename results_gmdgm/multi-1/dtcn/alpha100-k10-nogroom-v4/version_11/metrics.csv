@@ -1,0 +1,2 @@
+epoch,batch,trial,tr_loss_y_kl,tr_loss_classifier,tr_loss_reconstruction,tr_kl_weight,tr_loss_kl,tr_loss,dataset
+0,442,-1,1.3483858751107576,48.46242645470337,24.45362181480528,0.10000000000000081,0.2771225244143209,74.54155667494041,-1

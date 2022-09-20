@@ -69,6 +69,10 @@ def train_model(hparams):
     elif hparams['model_class'].lower() == 'gmdgm':
         from daart.models import GMDGM
         model = GMDGM(hparams)
+    elif hparams['model_class'].lower() == 'rslds':
+        from daart.models import RSLDS
+        print('using rslds')
+        model = RSLDS(hparams)
     else:
         raise NotImplementedError
     model.to(hparams['device'])

@@ -170,6 +170,12 @@ class RSLDSGenerative(BaseModel):
         py_indexer = y_t_skip_last.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_last.ndim, py_t_probs.shape[3])
         py_t_probs = torch.gather(py_t_probs, 2, py_indexer).squeeze(2)
         
+        # concat py_1 with py_t, t > 1
+        py_1_probs = self.hparams['py_1_probs']
+        py_probs = torch.zeros(py_t_probs.shape[0], py_t_probs.shape[1]+1, py_t_probs.shape[2]).to(device=self.hparams['device'])
+        py_probs[:, 1:, :] = py_t_probs
+        py_probs[:, 0, :] = torch.tensor(py_1_probs)
+        
         # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
         pz_t_mean = self.model['pz_t_mean'](z_t_skip_last_with_y_dim)
         pz_t_logvar = self.model['pz_t_logvar'](y_t_skip_first)
@@ -178,17 +184,25 @@ class RSLDSGenerative(BaseModel):
         pz_indexer = y_t_skip_first.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_first.ndim, pz_t_mean.shape[3])
         pz_t_mean = torch.gather(pz_t_mean, 2, pz_indexer).squeeze(2)
         
+        # concat pz_1 mean and logvar with pz_t mean and logvar, t > 1
+        pz_1_mean = torch.tensor(self.hparams['pz_1_mean'])
+        pz_mean = torch.zeros(pz_t_mean.shape[0], pz_t_mean.shape[1]+1, pz_t_mean.shape[2]).to(device=self.hparams['device'])
+        pz_mean[:, 1:, :] = pz_t_mean
+        pz_mean[:, 0, :] = pz_1_mean
+        
+        pz_1_logvar = torch.tensor(self.hparams['pz_1_logvar'])
+        pz_logvar = torch.zeros(pz_t_mean.shape[0], pz_t_mean.shape[1]+1, pz_t_mean.shape[2]).to(device=self.hparams['device'])
+        pz_logvar[:, 1:, :] = pz_t_logvar
+        pz_logvar[:, 0, :] = pz_1_logvar
+       
         # push sampled z from through decoder to get reconstruction
         # this will be the mean of p(x_t|z_t)
         x_hat = self.model['decoder'](z_input)
 
         return {
-            'py1_probs': self.hparams['py_1_probs'], # (n_total_classes)
-            'py_t_probs': py_t_probs, # (n_sequences, sequence_length, n_total_classes)
-            'pz_t_mean': pz_t_mean,  # (n_sequences, sequence_length, embedding_dim)
-            'pz_t_logvar': pz_t_logvar,  # (n_sequences, sequence_length, embedding_dim)
-            'pz_1_mean': self.hparams['pz_1_mean'],  # (embedding_dim)
-            'pz_1_logvar': self.hparams['pz_1_logvar'],  # (embedding_dim)
+            'py_probs': py_probs, # (n_sequences, sequence_length, n_total_classes)
+            'pz_mean': pz_t_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_logvar': pz_t_logvar,  # (n_sequences, sequence_length, embedding_dim)
             'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
         }
 
@@ -320,84 +334,6 @@ class RSLDS(BaseModel):
 
         return output_dict
     
-    
-    def predict_labels(self, data_generator, return_scores=False, remove_pad=True, mode='eval'):
-        """
-        Parameters
-        ----------
-        data_generator : DataGenerator object
-            data generator to serve data batches
-        return_scores : bool
-            return scores before they've been passed through softmax
-        remove_pad : bool
-            remove batch padding from model outputs before returning
-        Returns
-        -------
-        dict
-            - 'predictions' (list of lists): first list is over datasets; second list is over
-              batches in the dataset; each element is a numpy array of the label probability
-              distribution
-            - 'weak_labels' (list of lists): corresponding weak labels
-            - 'labels' (list of lists): corresponding labels
-        """
-        if mode == 'eval':
-            self.eval()
-        elif mode == 'train':
-            self.train()
-        else:
-            raise NotImplementedError(
-                'must choose mode="eval" or mode="train", not mode="%s"' % mode)
-
-        pad = self.hparams.get('sequence_pad', 0)
-        softmax = nn.Softmax(dim=1)
-
-        # initialize outputs dict
-        keys = ['y_logits','qy_x_probs','y_sample','qz_xy_mean','qz_xy_logvar'
-                ,'pz_y_mean','pz_y_logvar','reconstruction']
-        
-        results_dict = {}
-        
-        results_dict['markers'] = [[] for _ in range(data_generator.n_datasets)]
-        for sess, dataset in enumerate(data_generator.datasets):
-                results_dict['markers'][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
-
-        
-        for key in keys:
-            results_dict[key] = [[] for _ in range(data_generator.n_datasets)]
-
-            for sess, dataset in enumerate(data_generator.datasets):
-                results_dict[key][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
-                
-
-        # partially fill container (gap trials will be included as nans)
-        dtypes = ['train', 'val', 'test']
-        for dtype in dtypes:
-            data_generator.reset_iterators(dtype)
-            for i in range(data_generator.n_tot_batches[dtype]):
-                data, sess_list = data_generator.next_batch(dtype)  
-                    
-                outputs_dict = self.forward(data['markers'], data['labels_strong'])
-               # print('data 1', data['markers'].shape)
-                # remove padding if necessary
-                if pad > 0 and remove_pad:
-                    for key, val in outputs_dict.items():
-                        outputs_dict[key] = val[:, pad:-pad] if val is not None else None
-                    data['markers'] = data['markers'][:, pad:-pad] 
-                    #print('data 2', data['markers'].shape)
-                # loop over sequences in batch
-                for s, sess in enumerate(sess_list):
-                    batch_idx = data['batch_idx'][s].item()
-                    results_dict['markers'][sess][batch_idx] = \
-                    data['markers'][s].cpu().detach().numpy()
-                    for key in keys:
-                        
-                        # push through log-softmax, since this is included in the loss and not model
-                        results_dict[key][sess][batch_idx] = \
-                        outputs_dict[key][s].cpu().detach().numpy()
-                        #softmax(outputs_dict[key][s]).cpu().detach().numpy()
-                    
-        return results_dict
-    
     def training_step(self, data, accumulate_grad=True, **kwargs):
         """Calculate negative log-likelihood loss for supervised models.
         The batch is split into chunks if larger than a hard-coded `chunk_size` to keep memory
@@ -509,25 +445,25 @@ class RSLDS(BaseModel):
        # print('loss recon: ', loss_reconstruction)
     
     
-        # ----------------------------------------------
-        # compute kl loss between q(y|x) and p(y)
-        # ----------------------------------------------  
-        # create classifier q(y|x)
+        # ------------------------------------------------------------------
+        # compute kl loss between q(y_t|x_(T_t) and p(y_t|y_(t-1), z_(t-1))
+        # ------------------------------------------------------------------ 
+        # create classifier q(y_t|x_t)
         qy_x_probs = outputs_dict_rs['qy_x_probs']
         qy_x = Categorical(probs=qy_x_probs)
         
         # create prior p(y)
-        py_probs = torch.tensor(self.hparams['py_probs']).to(device=self.hparams.get('device'))
+        py_probs = torch.tensor(outputs_dict_rs['py_probs']).to(device=self.hparams.get('device'))
         py = Categorical(probs=py_probs) 
 
         loss_y_kl = torch.mean(kl_divergence(qy_x, py), axis=0) 
-        #print('loss_y_kl w/o weight: ', loss_y_kl)
+        print('loss_y_kl w/o weight: ', loss_y_kl)
         loss_y_kl = loss_y_kl * kl_y_weight
-        #print('loss_y_kl with weight: ', loss_y_kl)
+        print('loss_y_kl with weight: ', loss_y_kl)
         loss += loss_y_kl
   
         loss_dict['loss_y_kl'] = loss_y_kl.item()
- 
+        ppp
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y
