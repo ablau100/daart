@@ -26,7 +26,7 @@ class RSLDSGenerative(BaseModel):
     Generative model for rSLDS
     """
     
-    def __init__(self, hparams):
+    def __init__(self, hparams, model):
         """
         
         Parameters
@@ -36,7 +36,7 @@ class RSLDSGenerative(BaseModel):
         """
         super().__init__()
         self.hparams = hparams
-        self.model = hparams['model']
+        self.model = model
     
     def build_model(self):
         """Construct the generative netowork using hparams."""
@@ -67,17 +67,17 @@ class RSLDSGenerative(BaseModel):
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
 
         # build label prior: p(y_1)
-        probs = np.ones((self.hparams['n_total_classes'],))
+        probs = []#np.ones((self.hparams['n_total_classes'],))
         background_prob = 0.01
-        probs[0] = background_prob
+        probs.append(background_prob)
         
         new_classes_indexes = [1,2]
         
         for i in range(self.hparams['n_total_classes']):
             if i in new_classes_indexes:
-                probs[i] = (1-background_prob) * .7 * (1/len(new_classes_indexes))
+                probs.append((1-background_prob) * .7 * (1/len(new_classes_indexes)))
             elif i > 0:
-                probs[i] = (1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1))
+                probs.append((1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1)))
 
 #         probs[:self.hparams['output_size']] /= (self.hparams['output_size'] * 2)
 #         probs[self.hparams['output_size']:] /= (self.hparams['n_aug_classes'] * 2)
@@ -171,10 +171,10 @@ class RSLDSGenerative(BaseModel):
         py_t_probs = torch.gather(py_t_probs, 2, py_indexer).squeeze(2)
         
         # concat py_1 with py_t, t > 1
-        py_1_probs = self.hparams['py_1_probs']
+        py_1_probs = torch.tensor(self.hparams['py_1_probs'])
         py_probs = torch.zeros(py_t_probs.shape[0], py_t_probs.shape[1]+1, py_t_probs.shape[2]).to(device=self.hparams['device'])
-        py_probs[:, 1:, :] = py_t_probs
-        py_probs[:, 0, :] = torch.tensor(py_1_probs)
+        py_probs[:, 1:, :] = nn.Softmax(dim=2)(py_t_probs)
+        py_probs[:, 0, :] = py_1_probs
         
         # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
         pz_t_mean = self.model['pz_t_mean'](z_t_skip_last_with_y_dim)
@@ -187,6 +187,7 @@ class RSLDSGenerative(BaseModel):
         # concat pz_1 mean and logvar with pz_t mean and logvar, t > 1
         pz_1_mean = torch.tensor(self.hparams['pz_1_mean'])
         pz_mean = torch.zeros(pz_t_mean.shape[0], pz_t_mean.shape[1]+1, pz_t_mean.shape[2]).to(device=self.hparams['device'])
+        
         pz_mean[:, 1:, :] = pz_t_mean
         pz_mean[:, 0, :] = pz_1_mean
         
@@ -201,8 +202,8 @@ class RSLDSGenerative(BaseModel):
 
         return {
             'py_probs': py_probs, # (n_sequences, sequence_length, n_total_classes)
-            'pz_mean': pz_t_mean,  # (n_sequences, sequence_length, embedding_dim)
-            'pz_logvar': pz_t_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_mean': pz_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_logvar': pz_logvar,  # (n_sequences, sequence_length, embedding_dim)
             'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
         }
 
@@ -235,6 +236,8 @@ class RSLDS(BaseModel):
         """
         super().__init__()
         self.hparams = hparams
+        self.keys = ['py_probs','qy_x_probs','y_sample','qz_xy_mean','qz_xy_logvar'
+                ,'pz_mean','pz_logvar','reconstruction']
 
         # model dict will contain some or all of the following components:
         # - classifier: q(y|x) [weighted by hparams['lambda_strong'] on labeled data]
@@ -243,10 +246,10 @@ class RSLDS(BaseModel):
         # - latent_generator: p(z|y)
 
         self.model = nn.ModuleDict()
-        hparams['model'] = self.model
+        #hparams['model'] = self.model
         
-        self.inference = BaseInference(hparams)
-        self.generative = RSLDSGenerative(hparams)
+        self.inference = BaseInference(hparams, self.model)
+        self.generative = RSLDSGenerative(hparams, self.model)
         self.build_model()
 
         # label loss based on cross entropy; don't compute gradient when target = 0
@@ -255,10 +258,6 @@ class RSLDS(BaseModel):
         
         # MSE loss for reconstruction
         self.recon_loss = nn.MSELoss(reduction='mean')
-        
-        # maybe init z sample array and y sample array here?
-        self.z_samples_array = []
-        self.y_mixed_array = []
         
     def __str__(self):
         """Pretty print model architecture."""
@@ -316,10 +315,6 @@ class RSLDS(BaseModel):
         """
         
         inf_outputs = self.inference(x, y)
-        
-        # append new z sample and y mixed
-        self.z_samples_array.append(inf_outputs['z_xy_sample'])
-        self.y_mixed_array.append(inf_outputs['y_mixed'])
         
         # generative input
         gen_inputs = {
@@ -418,7 +413,7 @@ class RSLDS(BaseModel):
             loss += loss_strong
             # log
             loss_dict['loss_classifier'] = loss_strong.item()
-           # print('loss classifier: ', loss_strong.item())
+            #print('loss classifier: ', loss_strong.item())
         
         
         # ------------------------------------
@@ -442,50 +437,50 @@ class RSLDS(BaseModel):
         loss += loss_reconstruction
         # log
         loss_dict['loss_reconstruction'] = loss_reconstruction.item()
-       # print('loss recon: ', loss_reconstruction)
+        #print('loss recon: ', loss_reconstruction)
     
     
         # ------------------------------------------------------------------
         # compute kl loss between q(y_t|x_(T_t) and p(y_t|y_(t-1), z_(t-1))
         # ------------------------------------------------------------------ 
         # create classifier q(y_t|x_t)
-        qy_x_probs = outputs_dict_rs['qy_x_probs']
-        qy_x = Categorical(probs=qy_x_probs)
+        #qy_x_logits = 
+        qy_probs = outputs_dict_rs['qy_x_probs']
+        qy = Categorical(probs=qy_probs)
         
         # create prior p(y)
-        py_probs = torch.tensor(outputs_dict_rs['py_probs']).to(device=self.hparams.get('device'))
+        py_probs = outputs_dict_rs['py_probs']#.to(device=self.hparams.get('device'))
         py = Categorical(probs=py_probs) 
 
-        loss_y_kl = torch.mean(kl_divergence(qy_x, py), axis=0) 
-        print('loss_y_kl w/o weight: ', loss_y_kl)
+        loss_y_kl = torch.mean(kl_divergence(qy, py), axis=0) 
+        #print('loss_y_kl w/o weight: ', loss_y_kl)
         loss_y_kl = loss_y_kl * kl_y_weight
-        print('loss_y_kl with weight: ', loss_y_kl)
+        #print('loss_y_kl with weight: ', loss_y_kl)
         loss += loss_y_kl
   
         loss_dict['loss_y_kl'] = loss_y_kl.item()
-        ppp
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y
         # ----------------------------------------   
         # build MVN p(z|y)
-        pz_y_mean = outputs_dict_rs['pz_y_mean']
-        pz_y_std = outputs_dict_rs['pz_y_logvar'].exp().pow(0.5)
-        pz_y = Normal(pz_y_mean, pz_y_std)
+        pz_mean = outputs_dict_rs['pz_mean']
+        pz_std = outputs_dict_rs['pz_logvar'].exp().pow(0.5)
+        pz = Normal(pz_mean, pz_std)
         
         # build MVN q(z|x,y)
-        qz_xy_mean = outputs_dict_rs['qz_xy_mean']
-        qz_xy_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)
-        qz_xy = Normal(qz_xy_mean, qz_xy_std)
+        qz_mean = outputs_dict_rs['qz_xy_mean']
+        qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)
+        qz = Normal(qz_mean, qz_std)
         
         # sum over latent, mean over batch (mean?)
         
-        loss_kl = torch.mean(torch.sum(kl_divergence(qz_xy, pz_y), axis=1), axis=0)
+        loss_z_kl = torch.mean(torch.sum(kl_divergence(qz, pz), axis=1), axis=0)
 
-        loss += kl_weight * loss_kl
+        loss += kl_weight * loss_z_kl
         # log
         loss_dict['kl_weight'] = kl_weight
-        loss_dict['loss_kl'] = loss_kl.item() * kl_weight 
+        loss_dict['loss_z_kl'] = loss_z_kl.item() * kl_weight 
         #print('KL weight: ', kl_weight)
        # print('loss KL (w/o weight): ', loss_kl)
             

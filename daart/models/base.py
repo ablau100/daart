@@ -148,6 +148,82 @@ class BaseModel(nn.Module):
     def load_parameters_from_file(self, filepath):
         """Load parameters from .pt file."""
         self.load_state_dict(torch.load(filepath, map_location=lambda storage, loc: storage))
+        
+    def predict_labels(self, data_generator, return_scores=False, remove_pad=True, mode='eval'):
+        """
+        Parameters
+        ----------
+        data_generator : DataGenerator object
+            data generator to serve data batches
+        return_scores : bool
+            return scores before they've been passed through softmax
+        remove_pad : bool
+            remove batch padding from model outputs before returning
+        Returns
+        -------
+        dict
+            - 'predictions' (list of lists): first list is over datasets; second list is over
+              batches in the dataset; each element is a numpy array of the label probability
+              distribution
+            - 'weak_labels' (list of lists): corresponding weak labels
+            - 'labels' (list of lists): corresponding labels
+        """
+        if mode == 'eval':
+            self.eval()
+        elif mode == 'train':
+            self.train()
+        else:
+            raise NotImplementedError(
+                'must choose mode="eval" or mode="train", not mode="%s"' % mode)
+
+        pad = self.hparams.get('sequence_pad', 0)
+        softmax = nn.Softmax(dim=1)
+
+        # initialize outputs dict
+        keys = self.keys
+        
+        results_dict = {}
+        
+        results_dict['markers'] = [[] for _ in range(data_generator.n_datasets)]
+        for sess, dataset in enumerate(data_generator.datasets):
+                results_dict['markers'][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
+
+        
+        for key in keys:
+            results_dict[key] = [[] for _ in range(data_generator.n_datasets)]
+
+            for sess, dataset in enumerate(data_generator.datasets):
+                results_dict[key][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
+                
+
+        # partially fill container (gap trials will be included as nans)
+        dtypes = ['train', 'val', 'test']
+        for dtype in dtypes:
+            data_generator.reset_iterators(dtype)
+            for i in range(data_generator.n_tot_batches[dtype]):
+                data, sess_list = data_generator.next_batch(dtype)  
+                    
+                outputs_dict = self.forward(data['markers'], data['labels_strong'])
+               # print('data 1', data['markers'].shape)
+                # remove padding if necessary
+                if pad > 0 and remove_pad:
+                    for key, val in outputs_dict.items():
+                        outputs_dict[key] = val[:, pad:-pad] if val is not None else None
+                    data['markers'] = data['markers'][:, pad:-pad] 
+                    #print('data 2', data['markers'].shape)
+                # loop over sequences in batch
+                for s, sess in enumerate(sess_list):
+                    batch_idx = data['batch_idx'][s].item()
+                    results_dict['markers'][sess][batch_idx] = \
+                    data['markers'][s].cpu().detach().numpy()
+                    for key in keys:
+                        
+                        # push through log-softmax, since this is included in the loss and not model
+                        results_dict[key][sess][batch_idx] = \
+                        outputs_dict[key][s].cpu().detach().numpy()
+                        #softmax(outputs_dict[key][s]).cpu().detach().numpy()
+                    
+        return results_dict
 
 
 
@@ -237,7 +313,7 @@ class BaseInference(BaseModel):
     Approximate posterior setup shared among models
     """
     
-    def __init__(self, hparams):
+    def __init__(self, hparams, model):
         """
         
         Parameters
@@ -247,7 +323,7 @@ class BaseInference(BaseModel):
         """
         super().__init__()
         self.hparams = hparams
-        self.model = hparams['model']
+        self.model = model
 
     
     def build_model(self):
