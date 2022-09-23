@@ -180,7 +180,7 @@ def plot_training_curves(
 
     metrics_list = [
         'loss', 'loss_weak', 'loss_strong', 'loss_pred', 'loss_task', 'loss_kl', 'fc',
-        'loss_unlabeled', 'loss_reconstruction', 'loss_classifier', 'loss_entropy', 'loss_y_logprob', 'loss_y_kl'
+        'loss_unlabeled', 'loss_reconstruction', 'loss_classifier', 'loss_entropy', 'loss_y_logprob', 'loss_y_kl', 'loss_z_kl'
     ]
 
     metrics_dfs = [load_metrics_csv_as_df(metrics_file, metrics_list, expt_ids=expt_ids)]

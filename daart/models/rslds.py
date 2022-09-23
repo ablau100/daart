@@ -166,14 +166,14 @@ class RSLDSGenerative(BaseModel):
         # push y_(t-1) and z_(t-1) through generative model to get parameters of p(y_t|y_(t-1), z_(t-1))
         py_t_probs = self.model['py_t_probs'](z_t_skip_last_with_y_dim)
         
-        # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from y=0
+        # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
         py_indexer = y_t_skip_last.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_last.ndim, py_t_probs.shape[3])
         py_t_probs = torch.gather(py_t_probs, 2, py_indexer).squeeze(2)
         
         # concat py_1 with py_t, t > 1
         py_1_probs = torch.tensor(self.hparams['py_1_probs'])
         py_probs = torch.zeros(py_t_probs.shape[0], py_t_probs.shape[1]+1, py_t_probs.shape[2]).to(device=self.hparams['device'])
-        py_probs[:, 1:, :] = nn.Softmax(dim=2)(py_t_probs)
+        py_probs[:, 1:, :] = py_1_probs#nn.Softmax(dim=2)(py_t_probs)
         py_probs[:, 0, :] = py_1_probs
         
         # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
