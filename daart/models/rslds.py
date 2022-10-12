@@ -67,20 +67,20 @@ class RSLDSGenerative(BaseModel):
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
 
         # build label prior: p(y_1)
-        probs = []#np.ones((self.hparams['n_total_classes'],))
-        background_prob = 0.01
-        probs.append(background_prob)
+        probs = [.25, .25, .25, .25]#np.ones((self.hparams['n_total_classes'],))
+#         background_prob = 0.01
+#         probs.append(background_prob)
         
-        new_classes_indexes = [1,2]
+#         new_classes_indexes = [1,2]
         
-        for i in range(self.hparams['n_total_classes']):
-            if i in new_classes_indexes:
-                probs.append((1-background_prob) * .7 * (1/len(new_classes_indexes)))
-            elif i > 0:
-                probs.append((1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1)))
+#         for i in range(self.hparams['n_total_classes']):
+#             if i in new_classes_indexes:
+#                 probs.append((1-background_prob) * .7 * (1/len(new_classes_indexes)))
+#             elif i > 0:
+#                 probs.append((1-background_prob) * .3 * (1/(self.hparams['n_observed_classes']-1)))
 
 #         probs[:self.hparams['output_size']] /= (self.hparams['output_size'] * 2)
-#         probs[self.hparams['output_size']:] /= (self.hparams['n_aug_classes'] * 2)
+        #probs[:] /= (self.hparams['n_aug_classes']+self.hparams['n_observed_classes'])
         print('probs', probs)
 
         assert np.isclose([np.sum(np.array(probs))], [1])
@@ -173,7 +173,7 @@ class RSLDSGenerative(BaseModel):
         # concat py_1 with py_t, t > 1
         py_1_probs = torch.tensor(self.hparams['py_1_probs'])
         py_probs = torch.zeros(py_t_probs.shape[0], py_t_probs.shape[1]+1, py_t_probs.shape[2]).to(device=self.hparams['device'])
-        py_probs[:, 1:, :] = py_1_probs#nn.Softmax(dim=2)(py_t_probs)
+        py_probs[:, 1:, :] = nn.Softmax(dim=2)(py_t_probs) # test using old prior
         py_probs[:, 0, :] = py_1_probs
         
         # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
@@ -360,10 +360,10 @@ class RSLDS(BaseModel):
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
         
-        # remove labels for walk/still
-        for i in range(labels_wpad.shape[0]):
-            labels_wpad[i][labels_wpad[i]==1] = 0
-            labels_wpad[i][labels_wpad[i]==2] = 0
+#         # remove labels for walk/still
+#         for i in range(labels_wpad.shape[0]):
+#             labels_wpad[i][labels_wpad[i]==1] = 0
+#             labels_wpad[i][labels_wpad[i]==2] = 0
   
         outputs_dict = self.forward(markers_wpad, labels_wpad)
 
