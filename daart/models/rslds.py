@@ -67,7 +67,7 @@ class RSLDSGenerative(BaseModel):
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
 
         # build label prior: p(y_1)
-        probs = [.25, .25, .25, .25]#np.ones((self.hparams['n_total_classes'],))
+        probs = [0.00001, .1, .4, .4, .1]#np.ones((self.hparams['n_total_classes'],))
 #         background_prob = 0.01
 #         probs.append(background_prob)
         
@@ -87,23 +87,22 @@ class RSLDSGenerative(BaseModel):
         self.hparams['py_1_probs'] = probs
         
         # build updated label prior: p(y_t|y_(t-1), z_(t-1)), t > 1
-        # CHECK w MATT
         self.model['py_t_probs'] = self._build_linear(
-            0, 'py_t_probs', self.hparams['n_hid_units'], self.hparams['n_total_classes'])
+            0, 'py_t_probs', self.hparams['n_hid_units'], (self.hparams['n_total_classes']*self.hparams['n_total_classes']))
         
         # build latent prior: p(z_1)
         self.hparams['pz_1_mean'] = 0
         self.hparams['pz_1_logvar'] = 0
         
         # build latent_generator: p(z_t|z_(t-1), y_t)
-        self.model['pz_t_mean'] = self._build_linear(
-            0, 'pz_t_mean', self.hparams['n_hid_units'], self.hparams['n_hid_units'])
+#         self.model['pz_t_mean'] = self._build_linear(
+#             0, 'pz_t_mean', self.hparams['n_hid_units'], (self.hparams['n_hid_units']))
         
-        self.model['pz_t_logvar'] = Module(
-            self.hparams, 
-            in_size=self.hparams['n_total_classes'],
-            hid_size=self.hparams['n_hid_units'],
-            out_size=self.hparams['n_hid_units'])
+        self.model['pz_t_mean'] = self._build_linear(
+            0, 'pz_t_mean', self.hparams['n_hid_units'], (self.hparams['n_hid_units']*self.hparams['n_total_classes']))
+        
+        self.model['pz_t_logvar'] = self._build_linear(
+            0, 'pz_t_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
         
         # build decoder: p(x_t|z_t)
         self.model['decoder'] = Module(
@@ -129,17 +128,20 @@ class RSLDSGenerative(BaseModel):
             format_str += 'p(y_t|y_(t-1), z_(t-1)):\n'
             for i, module in enumerate(self.model['py_t_probs']):
                 format_str += str('    {}: {}\n'.format(i, module))
+                format_str += str(' Weights py: {}\n'.format(module.weight))
             format_str += '\n'
                 
         if 'pz_t_mean' in self.model:
             format_str += 'p(z_t|z_(t-1), y_t) mean:\n'
             for i, module in enumerate(self.model['pz_t_mean']):
                 format_str += str('    {}: {}\n'.format(i, module))
+                format_str += str(' Weights pz: {}\n'.format(module.weight))
+            
                 
-        if 'pz_t_logvar' in self.model:
-            format_str += 'p(z_t|z_(t-1), y_t) logvar:\n'
-            for i, module in enumerate(self.model['pz_t_logvar']):
-                format_str += str('    {}: {}\n'.format(i, module))
+#         if 'pz_t_logvar' in self.model:
+#             format_str += 'p(z_t|z_(t-1), y_t) logvar:\n'
+#             for i, module in enumerate(self.model['pz_t_logvar']):
+#                 format_str += str('    {}: {}\n'.format(i, module))
 
         return format_str
     
@@ -163,22 +165,37 @@ class RSLDSGenerative(BaseModel):
         y_t_skip_first = y_input[:, 1:, :]
         y_t_skip_last = y_input[:, :-1, :]
         
-        # push y_(t-1) and z_(t-1) through generative model to get parameters of p(y_t|y_(t-1), z_(t-1))
-        py_t_probs = self.model['py_t_probs'](z_t_skip_last_with_y_dim)
-        
+        # push z_(t-1) through generative model to get parameters of p(y_t|y_(t-1), z_(t-1))
+        py_t_probs = self.model['py_t_probs'](z_t_skip_last)
+        #print('old shape py', py_t_probs.shape)
+        py_t_probs = torch.reshape(py_t_probs, (py_t_probs.shape[0], py_t_probs.shape[1], y_dim,-1))
+        #print('new shape py', py_t_probs.shape)
         # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
         py_indexer = y_t_skip_last.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_last.ndim, py_t_probs.shape[3])
         py_t_probs = torch.gather(py_t_probs, 2, py_indexer).squeeze(2)
+        #print('indexed shape py', py_t_probs.shape)
         
         # concat py_1 with py_t, t > 1
         py_1_probs = torch.tensor(self.hparams['py_1_probs'])
+        #print('py_1_probs', py_1_probs.shape)
+        
         py_probs = torch.zeros(py_t_probs.shape[0], py_t_probs.shape[1]+1, py_t_probs.shape[2]).to(device=self.hparams['device'])
-        py_probs[:, 1:, :] = nn.Softmax(dim=2)(py_t_probs) # test using old prior
+        py_probs[:, 1:, :] = py_1_probs#nn.Softmax(dim=2)(py_t_probs) # test using old prior
         py_probs[:, 0, :] = py_1_probs
         
         # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
-        pz_t_mean = self.model['pz_t_mean'](z_t_skip_last_with_y_dim)
+        #pz_t_mean = self.model['pz_t_mean'](z_t_skip_last_with_y_dim)
+        #print('old shape', pz_t_mean.shape, pz_t_mean.size)
+        
+        # index proper way
+        # reshape output then index
+        # first just try mean
+        pz_t_mean = self.model['pz_t_mean'](z_t_skip_last)
+        pz_t_mean = torch.reshape(pz_t_mean, (pz_t_mean.shape[0], pz_t_mean.shape[1], y_dim,-1))
+        #print('new shape pz', pz_t_mean.shape)
+        
         pz_t_logvar = self.model['pz_t_logvar'](y_t_skip_first)
+        
         
         # index logvar by y_t - z_t starts from t=1, so our indexer y starts from y=1
         pz_indexer = y_t_skip_first.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_first.ndim, pz_t_mean.shape[3])
@@ -271,6 +288,80 @@ class RSLDS(BaseModel):
         format_str += self.generative.__str__()
 
         return format_str
+    
+    def sampler(self, num_samples=1000):
+        
+        y_samples = []
+        z_samples = []
+        x_samples = []
+        
+        y_dim = self.hparams['n_total_classes']
+        
+        ##################
+        # for t = 1
+        ##################
+        
+        # sample y_1
+        py_1_probs = torch.tensor(self.hparams['py_1_probs'])
+        py_1 = Categorical(probs=py_1_probs)
+        y_1 = py_1.sample()#.type(torch.FloatTensor)
+        #print('un', y_1.unsqueeze(-1).shape)
+        y_1 = MakeOneHot()(y_1.unsqueeze(-1), self.hparams['n_total_classes']).type(torch.LongTensor)
+        y_samples.append(torch.squeeze(y_1))
+        
+        # sample z_1
+        z_1 = torch.normal(0, torch.ones(self.hparams['n_hid_units']))
+        z_samples.append(z_1)
+        
+        # sample x_1 | z_1
+        
+        ##################
+        # for t = 2 to T
+        ##################
+        
+        
+        for t in range(1, num_samples):
+            print('t', t)
+            #print('y t-1', y_samples[t-1])
+            # sample y_t | y_(t-1), z_(t-1)
+            
+            py_t_probs = self.model['py_t_probs'](z_samples[t-1])
+            py_t_probs = torch.sigmoid(torch.reshape(py_t_probs, (y_dim,-1)))
+            
+            #print('py p sig', py_t_probs, py_t_probs.shape)
+ 
+            # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
+            y_ind = torch.argmax(y_samples[t-1])
+            py_t_probs = py_t_probs[y_ind]
+            
+            #print('py p', py_t_probs, py_t_probs.shape)
+            py_t = Categorical(probs=py_t_probs)
+            y_t = py_t.sample()
+            
+            y_t = MakeOneHot()(y_t.unsqueeze(-1), self.hparams['n_total_classes']).type(torch.LongTensor)
+            y_t = torch.squeeze(y_t).type(torch.LongTensor)
+            #print('yt', y_t, y_t.shape)
+            y_samples.append(y_t)
+
+            # sample z_t | y_t, z_(t-1)
+            pz_t_mean = self.model['pz_t_mean'](z_samples[t-1])
+            pz_t_mean = torch.reshape(pz_t_mean, (y_dim,-1))
+            
+            z_ind = torch.argmax(y_samples[t])
+            print('z ind', z_ind, z_ind.shape)
+            #print('z ind un', z_ind.squeeze(-1), z_ind.squeeze(-1).shape)
+            pz_t_mean = pz_t_mean[z_ind]
+
+            pz_t_logvar = self.model['pz_t_logvar'](y_samples[t].type(torch.FloatTensor))
+            
+            z_t = torch.normal(pz_t_mean, pz_t_logvar)
+            z_samples.append(z_t)
+        
+        
+        # sample x_t | z_t
+        
+        return y_samples, z_samples
+        
         
         
     def build_model(self):
@@ -360,10 +451,10 @@ class RSLDS(BaseModel):
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
         
-#         # remove labels for walk/still
-#         for i in range(labels_wpad.shape[0]):
-#             labels_wpad[i][labels_wpad[i]==1] = 0
-#             labels_wpad[i][labels_wpad[i]==2] = 0
+        # remove labels for walk/still
+        for i in range(labels_wpad.shape[0]):
+            labels_wpad[i][labels_wpad[i]==2] = 0
+            labels_wpad[i][labels_wpad[i]==3] = 0
   
         outputs_dict = self.forward(markers_wpad, labels_wpad)
 
