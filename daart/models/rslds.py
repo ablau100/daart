@@ -97,8 +97,8 @@ class RSLDSGenerative(BaseModel):
             0, 'py_t_probs', self.hparams['n_hid_units'], (self.hparams['n_total_classes']*self.hparams['n_total_classes']))
         
         # build latent prior: p(z_1)
-        self.hparams['pz_1_mean'] = 0
-        self.hparams['pz_1_logvar'] = 1e-4#0
+        self.hparams['pz_1_mean'] = [0,1]
+        self.hparams['pz_1_logvar'] = -9.21
         
         # build latent_generator: p(z_t|z_(t-1), y_t)
         self.model['pz_t_mean'] = self._build_linear(
@@ -108,12 +108,16 @@ class RSLDSGenerative(BaseModel):
             0, 'pz_t_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
         
         # build decoder: p(x_t|z_t)
-        self.model['decoder'] = Module(
-            self.hparams, 
-            type='decoder',
-            in_size=self.hparams['n_hid_units'],
-            hid_size=self.hparams['n_hid_units'],
-            out_size=self.hparams['input_size'])
+        self.model['decoder'] = self._build_linear(
+            0, 'decoder', self.hparams['n_hid_units'], self.hparams['input_size'])
+        
+        
+#         self.model['decoder'] = Module(
+#             self.hparams, 
+#             type='decoder',
+#             in_size=self.hparams['n_hid_units'],
+#             hid_size=self.hparams['n_hid_units'],
+#             out_size=self.hparams['input_size'])
         
     def __str__(self):
         """Pretty print generative model architecture."""
@@ -121,17 +125,18 @@ class RSLDSGenerative(BaseModel):
         format_str = 'Generative network architecture: %s\n' % self.hparams['backbone_generative'].upper()
         format_str += '------------------------\n'
 
-        if 'decoder' in self.model:
-            format_str += 'Decoder (p(x_t|z_t)):\n'
-            for i, module in enumerate(self.model['decoder'].model):
-                format_str += str('    {}: {}\n'.format(i, module))
-            format_str += '\n'
+#         if 'decoder' in self.model:
+#             format_str += 'Decoder (p(x_t|z_t)):\n'
+#             for i, module in enumerate(self.model['decoder'].model):
+#                 format_str += str('    {}: {}\n'.format(i, module))
+#             format_str += '\n'
 
         if 'py_t_probs' in self.model:
             format_str += 'p(y_t|y_(t-1), z_(t-1)):\n'
             for i, module in enumerate(self.model['py_t_probs']):
                 format_str += str('    {}: {}\n'.format(i, module))
                 format_str += str(' Weights py: {}\n'.format(module.weight))
+                format_str += str(' bias py: {}\n'.format(module.bias))
             format_str += '\n'
                 
         if 'pz_t_mean' in self.model:
@@ -139,6 +144,7 @@ class RSLDSGenerative(BaseModel):
             for i, module in enumerate(self.model['pz_t_mean']):
                 format_str += str('    {}: {}\n'.format(i, module))
                 format_str += str(' Weights pz: {}\n'.format(module.weight))
+                format_str += str(' bias pz: {}\n'.format(module.bias))
             
                 
 #         if 'pz_t_logvar' in self.model:
@@ -149,7 +155,14 @@ class RSLDSGenerative(BaseModel):
         return format_str
     
     def forward(self, **kwargs): 
-                
+        
+        """
+        forward function for rSLDS generative model
+        kwargs['z_sample']: (n_sequences, sequence_length, embedding_dim)
+        kwargs['y_sample']: (n_sequences, sequence_length, n_total_classes)
+        
+        """
+        
         z_input = kwargs['z_sample']
         y_input = kwargs['y_sample']
         y_dim = self.hparams['n_total_classes']
@@ -334,7 +347,89 @@ class RSLDS(BaseModel):
             y_ind = torch.argmax(y_samples[t-1])
             py_t_probs = py_t_probs[y_ind] # (y_dim, y_dim)
             
-            print('py p', py_t_probs, py_t_probs.shape)
+            #print('py p', py_t_probs, py_t_probs.shape)
+            py_t = Categorical(logits=py_t_probs)
+            y_t = py_t.sample()
+            
+            y_t = MakeOneHot()(y_t.unsqueeze(-1), self.hparams['n_total_classes']).type(torch.LongTensor)
+            y_t = torch.squeeze(y_t).type(torch.LongTensor)
+            y_samples.append(y_t)
+
+            # sample z_t | y_t, z_(t-1)
+            pz_t_mean = self.model['pz_t_mean'](z_samples[t-1])
+            
+            pz_t_mean = torch.reshape(pz_t_mean, (y_dim,-1)) # (y dim, z dim)
+
+            
+            z_ind = torch.argmax(y_samples[t])
+            pz_t_mean = pz_t_mean[z_ind]
+            
+            # use fix var for test
+            pz_t_logvar = torch.ones_like(pz_t_mean) * 1e-4#self.model['pz_t_logvar'](y_samples[t].type(torch.FloatTensor))
+            
+            z_t = torch.normal(pz_t_mean, pz_t_logvar)
+            z_samples.append(z_t)
+        
+        
+        # sample x_t | z_t
+        for t in range(0, num_samples):
+            
+            x_sample = self.model['decoder'](z_samples[t])
+            x_samples.append(x_sample)
+        
+        
+        return y_samples, z_samples, x_samples
+    
+    
+    def sampler_R(self, num_samples=1000):
+        
+        y_samples = []
+        z_samples = []
+        x_samples = []
+        #self.hparams['py_1_probs'] = [.25,.25,.25,.25]
+        self.hparams['py_1_probs'] = [-1.09861, -1.09861, -1.09861, -1.09861]
+        y_dim = 4#self.hparams['n_total_classes']
+        self.hparams['n_total_classes'] = 4
+        
+        ##################
+        # for t = 1
+        ##################
+        
+        # sample y_1
+        py_1_probs = torch.tensor(self.hparams['py_1_probs'])
+        
+        py_1 = Categorical(logits=py_1_probs)
+        y_1 = py_1.sample()#.type(torch.FloatTensor)
+        #print('un', y_1.unsqueeze(-1).shape)
+        y_1 = MakeOneHot()(y_1.unsqueeze(-1), self.hparams['n_total_classes']).type(torch.LongTensor)
+        y_samples.append(torch.squeeze(y_1))
+        
+        # sample z_1
+        z_1 = torch.normal(torch.tensor([0,1]).type(torch.FloatTensor), torch.ones(self.hparams['n_hid_units']) * 1e-4)
+        z_samples.append(z_1)
+        
+        # sample x_1 | z_1
+        
+        ##################
+        # for t = 2 to T
+        ##################
+        
+        
+        for t in range(1, num_samples):
+            
+            # sample y_t | y_(t-1), z_(t-1)
+            
+            py_t_probs = self.model['py_t_probs'](z_samples[t-1])
+         
+            py_t_probs = (torch.reshape(py_t_probs, (y_dim,-1)))
+            
+           
+ 
+            # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
+            y_ind = torch.argmax(y_samples[t-1])
+            py_t_probs = py_t_probs[y_ind] # (y_dim, y_dim)
+            
+            #print('py p', py_t_probs, py_t_probs.shape)
             py_t = Categorical(logits=py_t_probs)
             y_t = py_t.sample()
             
@@ -489,7 +584,7 @@ class RSLDS(BaseModel):
                 outputs_dict_rs[key] = val
                 
         # pull out indices of labeled data for loss computation
-        idxs_labeled = outputs_dict_rs['idxs_labeled']
+        idxs_labeled = outputs_dict_rs['idxs_labeled'].squeeze(-1)
 
         # initialize loss to zero
         loss = 0
@@ -512,11 +607,11 @@ class RSLDS(BaseModel):
         # ------------------------------------ 
         reconstruction = outputs_dict_rs['reconstruction']
         px_z_mean = reconstruction
-        px_z_std = torch.ones_like(px_z_mean)
+        px_z_std = torch.ones_like(px_z_mean)* 1e-2
 
         px_z = Normal(px_z_mean, px_z_std)
         
-        # diff bwetween log prob of adding 1d Normals and MVN log prob
+        # diff between log prob of adding 1d Normals and MVN log prob
         k = markers_rs.shape[1]
         mvn_scalar =  (-1) * .5 * math.log(k)
         
@@ -529,27 +624,47 @@ class RSLDS(BaseModel):
         # log
         loss_dict['loss_reconstruction'] = loss_reconstruction.item()
         #print('loss recon: ', loss_reconstruction)
-    
-    
-        # ------------------------------------------------------------------
-        # compute kl loss between q(y_t|x_(T_t) and p(y_t|y_(t-1), z_(t-1))
-        # ------------------------------------------------------------------ 
-        # create classifier q(y_t|x_t)
-        #qy_x_logits = 
-        qy_logits = outputs_dict_rs['qy_x_logits']
-        qy = Categorical(logits=qy_logits)
         
-        # create prior p(y)
-        py_logits = outputs_dict_rs['py_logits']#.to(device=self.hparams.get('device'))
+        
+        # -------------------------------------------------------
+        # compute log p(y_t | y_(t-1), z_(t-1)) loss for labeled
+        # -------------------------------------------------------
+ 
+        py_logits = outputs_dict_rs['py_logits'][idxs_labeled > 0, :]
+        y_mixed = outputs_dict_rs['y_mixed']
+        y_mixed_scalar = torch.argmax(y_mixed, axis=1)[idxs_labeled > 0]
+        
         py = Categorical(logits=py_logits) 
+        
+        loss_py = torch.mean(py.log_prob(y_mixed_scalar), axis=0) * (-1)
+                   
+        loss += loss_py
+        
+        # log
+        loss_dict['loss_py'] = loss_py.item()
+        #print('loss recon: ', loss_reconstruction)
+    
+        # ----------------------------------------------------------------------------------
+        # compute kl loss between q(y_t|x_(T_t) and p(y_t|y_(t-1), z_(t-1)) for unlabeled
+        # ----------------------------------------------------------------------------------
+        
+        # check that we have unlabeled observatios
+        if idxs_labeled.sum() < idxs_labeled.shape[0]:
+        
+            # create classifier q(y_t|x_t) 
+            qy_logits = outputs_dict_rs['qy_x_logits'][idxs_labeled == 0, :]
+            qy = Categorical(logits=qy_logits)
 
-        loss_y_kl = torch.mean(kl_divergence(qy, py), axis=0) 
-        #print('loss_y_kl w/o weight: ', loss_y_kl)
-        loss_y_kl = loss_y_kl * kl_y_weight
-        #print('loss_y_kl with weight: ', loss_y_kl)
-        loss += loss_y_kl
-  
-        loss_dict['loss_y_kl'] = loss_y_kl.item()
+            # create prior p(y)
+            py_logits = outputs_dict_rs['py_logits'][idxs_labeled == 0, :]
+            py = Categorical(logits=py_logits) 
+
+            loss_y_kl = torch.mean(kl_divergence(qy, py), axis=0) 
+            loss_y_kl = loss_y_kl * kl_y_weight
+
+            loss += loss_y_kl
+
+            loss_dict['loss_y_kl'] = loss_y_kl.item()
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y

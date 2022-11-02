@@ -401,7 +401,8 @@ class BaseInference(BaseModel):
         
         # initialize and sample q(y|x) (should be a one-hot vector)
         qy_x_probs = nn.Softmax(dim=2)(y_logits)
-        qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], probs=qy_x_probs)
+        qy_x_logits = y_logits
+        qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], logits=qy_x_logits)
 
         y_sample = qy_x.rsample()  # (n_sequences, sequence_length, n_total_classes)
         
@@ -416,7 +417,7 @@ class BaseInference(BaseModel):
         # loop over sequences in batch
         idxs_labeled = torch.zeros_like(y)
         for s in range(y_mixed.shape[0]):
-            idxs_labeled[s] = y[s] != 0
+            idxs_labeled[s] = y[s] != self.hparams.get('ignore_class', 0)
             y_mixed[s, ~idxs_labeled[s], :] = y_sample[s, ~idxs_labeled[s]]
         
         # concatenate sample with input x
@@ -435,6 +436,7 @@ class BaseInference(BaseModel):
         return {
             'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
             'qy_x_probs': qy_x_probs,  # (n_sequences, sequence_length, n_classes)
+            'qy_x_logits': qy_x_logits,  # (n_sequences, sequence_length, n_classes)
             'y_sample': y_sample,  # (n_sequences, sequence_length, n_classes)
             'y_mixed': y_mixed,  # (n_sequences, sequence_length, n_classes)
             'qz_xy_mean': qz_xy_mean,  # (n_sequences, sequence_length, embedding_dim)
