@@ -92,9 +92,18 @@ class RSLDSGenerative(BaseModel):
         #self.hparams['py_1_probs'] = probs
         self.hparams['py_1_logits'] = logits
         
-        # build updated label prior: p(y_t|y_(t-1), z_(t-1)), t > 1
+#         # build updated label prior: p(y_t|y_(t-1), z_(t-1)), t > 1
+
+#         self.model['py_t_probs'] = self._build_linear(
+#             0, 'py_t_probs', self.hparams['n_hid_units'], (self.hparams['n_total_classes']*self.hparams['n_total_classes']))
+           
         self.model['py_t_probs'] = self._build_linear(
-            0, 'py_t_probs', self.hparams['n_hid_units'], (self.hparams['n_total_classes']*self.hparams['n_total_classes']))
+            0, 'py_t_probs', self.hparams['n_hid_units'], self.hparams['n_total_classes'])
+        
+#         self.model['py_t_probs'] = self._build_mlp(
+#             0, self.hparams['n_hid_units'], 16, self.hparams['n_total_classes'])
+        
+        
         
         # build latent prior: p(z_1)
         self.hparams['pz_1_mean'] = [0,1]
@@ -104,12 +113,18 @@ class RSLDSGenerative(BaseModel):
         self.model['pz_t_mean'] = self._build_linear(
             0, 'pz_t_mean', self.hparams['n_hid_units'], (self.hparams['n_hid_units']*self.hparams['n_total_classes']))
         
+#         self.model['pz_t_mean'] = self._build_mlp(
+#             0, self.hparams['n_hid_units'], 16, (self.hparams['n_hid_units']*self.hparams['n_total_classes']))
+        
         self.model['pz_t_logvar'] = self._build_linear(
             0, 'pz_t_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
         
         # build decoder: p(x_t|z_t)
         self.model['decoder'] = self._build_linear(
             0, 'decoder', self.hparams['n_hid_units'], self.hparams['input_size'])
+        
+#         self.model['decoder'] = self._build_mlp(
+#             0, self.hparams['n_hid_units'], 16, self.hparams['input_size'])
         
         
 #         self.model['decoder'] = Module(
@@ -118,6 +133,40 @@ class RSLDSGenerative(BaseModel):
 #             in_size=self.hparams['n_hid_units'],
 #             hid_size=self.hparams['n_hid_units'],
 #             out_size=self.hparams['input_size'])
+
+        
+        As = torch.tensor(
+             [[ 9.80436447e-01, -1.30991746e-01],
+             [ 1.27755862e-01,  9.88280774e-01],
+             [ 9.87511608e-01, -6.56728202e-02],
+             [ 6.21772981e-02,  9.93775794e-01],
+             [ 9.93601840e-01,  1.04869992e-03],
+             [ 6.04993083e-04,  9.87245556e-01],
+             [ 9.94231254e-01, -2.44135927e-04],
+             [-1.31332387e-03,  9.86318472e-01]])
+
+        bs = torch.tensor([ 0.16618703, -0.30929626, -0.01083673,  0.08616756,  0.10652665, -0.01280473,
+     -0.24733377,  0.01513071])
+        
+        
+        R = torch.tensor([[ 10.8405,   1.1295],
+        [-10.9805,  -1.1826],
+        [  0.2394,  -1.6910],
+        [ -0.0995,   1.7440]])
+        
+        r = torch.tensor([-16.5698,  -3.9294,  11.4060,   9.0931])
+
+        for i, module in enumerate(self.model['pz_t_mean']):
+            module.weight = nn.Parameter(As)
+            module.bias = nn.Parameter(bs)
+        
+        for i, module in enumerate(self.model['py_t_probs']):
+            module.weight = nn.Parameter(R)
+            module.bias = nn.Parameter(r)
+            
+            
+            
+        
         
     def __str__(self):
         """Pretty print generative model architecture."""
@@ -183,11 +232,11 @@ class RSLDSGenerative(BaseModel):
         
         # push z_(t-1) through generative model to get parameters of p(y_t|y_(t-1), z_(t-1))
         py_t_logits = self.model['py_t_probs'](z_t_skip_last)
-        py_t_logits = torch.reshape(py_t_logits, (py_t_logits.shape[0], py_t_logits.shape[1], y_dim,-1))
+#         py_t_logits = torch.reshape(py_t_logits, (py_t_logits.shape[0], py_t_logits.shape[1], y_dim,-1))
 
-        # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
-        py_indexer = y_t_skip_last.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_last.ndim, py_t_logits.shape[3])
-        py_t_logits = torch.gather(py_t_logits, 2, py_indexer).squeeze(2)
+#         # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
+#         py_indexer = y_t_skip_last.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_last.ndim, py_t_logits.shape[3])
+#         py_t_logits = torch.gather(py_t_logits, 2, py_indexer).squeeze(2)
         
         # concat py_1 with py_t, t > 1
         py_1_logits = torch.tensor(self.hparams['py_1_logits'])
@@ -338,14 +387,14 @@ class RSLDS(BaseModel):
             # sample y_t | y_(t-1), z_(t-1)
             
             py_t_probs = self.model['py_t_probs'](z_samples[t-1])
-         
-            py_t_probs = (torch.reshape(py_t_probs, (y_dim,-1)))
             
-           
+            
+        
+#             py_t_probs = (torch.reshape(py_t_probs, (y_dim,-1)))   
  
-            # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
-            y_ind = torch.argmax(y_samples[t-1])
-            py_t_probs = py_t_probs[y_ind] # (y_dim, y_dim)
+#             # index probs by y_(t-1) - y_t starts from t=1, so our indexer y starts from t=0
+#             y_ind = torch.argmax(y_samples[t-1])
+#             py_t_probs = py_t_probs[y_ind] # (y_dim, y_dim)
             
             #print('py p', py_t_probs, py_t_probs.shape)
             py_t = Categorical(logits=py_t_probs)

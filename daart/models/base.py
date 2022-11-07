@@ -93,7 +93,7 @@ class BaseModel(nn.Module):
 
     @staticmethod
     def _build_mlp(
-            self, global_layer_num, in_size, hid_size, out_size, n_hid_layers=1,
+            global_layer_num, in_size, hid_size, out_size, n_hid_layers=1,
             activation='lrelu'):
 
         mlp = nn.Sequential()
@@ -350,20 +350,20 @@ class BaseInference(BaseModel):
             in_size=self.hparams['input_size'], 
             hid_size=self.hparams['n_hid_units'], 
             out_size=self.hparams['n_total_classes'])
-        
+
         self.hparams['qy_x_temperature'] = 1#torch.tensor([1]).to(device=self.hparams['device'])
-        
+
         # build encoder: q(z|x,y)
         self.model['encoder'] = Module(
             self.hparams, 
             in_size=self.hparams['n_total_classes'] + self.hparams['input_size'],
             hid_size=self.hparams['n_hid_units'],
             out_size=self.hparams['n_hid_units'])
-        
+
         self.model['qz_xy_mean'] = self._build_linear(
             global_layer_num=len(self.model['qy_x'].model), name='qz_xy_mean',
             in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
-        
+
         self.model['qz_xy_logvar'] = self._build_linear(
             global_layer_num=len(self.model['qy_x'].model), name='qz_xy_logvar',
                     in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units']) 
