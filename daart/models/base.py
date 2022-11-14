@@ -344,12 +344,17 @@ class BaseInference(BaseModel):
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_inference'])
 
         # build classifier: q(y|x)
-        self.model['qy_x'] = Module(
-            self.hparams, 
-            type='decoder',
-            in_size=self.hparams['input_size'], 
-            hid_size=self.hparams['n_hid_units'], 
-            out_size=self.hparams['n_total_classes'])
+#         self.model['qy_x'] = Module(
+#             self.hparams, 
+#             type='decoder',
+#             in_size=self.hparams['input_size'], 
+#             hid_size=self.hparams['n_hid_units'], 
+#             out_size=self.hparams['n_total_classes'])
+
+
+        self.model['qy_x'] = self._build_linear(
+            global_layer_num=0, name='qy_x',
+            in_size=self.hparams['input_size'], out_size=self.hparams['n_total_classes'])
 
         self.hparams['qy_x_temperature'] = 1#torch.tensor([1]).to(device=self.hparams['device'])
 
@@ -360,12 +365,21 @@ class BaseInference(BaseModel):
             hid_size=self.hparams['n_hid_units'],
             out_size=self.hparams['n_hid_units'])
 
+#         self.model['qz_xy_mean'] = self._build_linear(
+#             global_layer_num=len(self.model['qy_x'].model), name='qz_xy_mean',
+#             in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
+
+#         self.model['qz_xy_logvar'] = self._build_linear(
+#             global_layer_num=len(self.model['qy_x'].model), name='qz_xy_logvar',
+#                     in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units']) 
+
+
         self.model['qz_xy_mean'] = self._build_linear(
-            global_layer_num=len(self.model['qy_x'].model), name='qz_xy_mean',
-            in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
+                    global_layer_num=0, name='qz_xy_mean',
+                    in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
 
         self.model['qz_xy_logvar'] = self._build_linear(
-            global_layer_num=len(self.model['qy_x'].model), name='qz_xy_logvar',
+            global_layer_num=0, name='qz_xy_logvar',
                     in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units']) 
         
     def __str__(self):
@@ -398,27 +412,34 @@ class BaseInference(BaseModel):
     def forward(self, x, y):
         # push inputs through classifier to get q(y|x)
         y_logits = self.model['qy_x'](x)
-        
+        #print('qy logits', torch.argmax(y_logits, axis=2))
         # initialize and sample q(y|x) (should be a one-hot vector)
         qy_x_probs = nn.Softmax(dim=2)(y_logits)
         qy_x_logits = y_logits
         qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], logits=qy_x_logits)
 
         y_sample = qy_x.rsample()  # (n_sequences, sequence_length, n_total_classes)
-        
+        #print('ysamp inf', y_sample)
         # make ground truth y into onehot
         y_onehot = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_total_classes']], device=y_logits.device)
         for s in range(y.shape[0]):
-            one_hot = MakeOneHot()(y[s], self.hparams['n_total_classes'])
-            y_onehot[s] = one_hot
+            for i in range(y.shape[1]):
+                if y[s][i] != self.hparams.get('ignore_class', 0):
+                    #print('y here', y[s][i].unsqueeze(0))
+                    one_hot = MakeOneHot()(y[s][i].unsqueeze(0), self.hparams['n_total_classes'])
+                    y_onehot[s][i] = one_hot
+                else:
+                    y_onehot[s][i] = torch.zeros(self.hparams['n_total_classes'])
 
         # init y_mixed, which will contain true labels for labeled data, samples for unlabled data
         y_mixed = y_onehot.clone().detach()  # (n_sequences, sequence_length, n_total_classes)
         # loop over sequences in batch
         idxs_labeled = torch.zeros_like(y)
         for s in range(y_mixed.shape[0]):
-            idxs_labeled[s] = y[s] != self.hparams.get('ignore_class', 0)
-            y_mixed[s, ~idxs_labeled[s], :] = y_sample[s, ~idxs_labeled[s]]
+            for i in range(y_mixed.shape[1]):
+                idxs_labeled[s][i] = y[s][i] != self.hparams.get('ignore_class', 0)
+                if idxs_labeled[s][i] == 0:
+                    y_mixed[s, i, :] = y_sample[s, i]
         
         # concatenate sample with input x
         # (n_sequences, sequence_length, n_total_classes))
@@ -432,6 +453,7 @@ class BaseInference(BaseModel):
             
         # sample with reparam trick
         z_xy_sample = qz_xy_mean + torch.randn(qz_xy_mean.shape, device=y_logits.device) * qz_xy_logvar.exp().pow(0.5)
+        
         
         return {
             'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
