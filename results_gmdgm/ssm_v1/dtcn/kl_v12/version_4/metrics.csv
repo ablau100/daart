@@ -1,0 +1,1 @@
+epoch,batch,trial,tr_loss_classifier,tr_loss_reconstruction,tr_loss_py,tr_loss_y_kl,tr_loss_y_kl_uniform,tr_kl_weight,tr_loss_z_kl,tr_loss,dataset,best_val_epoch,val_loss_classifier,val_loss_reconstruction,val_loss_py,val_loss_y_kl,val_loss_y_kl_uniform,val_kl_weight,val_loss_z_kl,val_loss

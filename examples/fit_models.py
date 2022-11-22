@@ -101,7 +101,13 @@ def train_model(hparams):
     if hparams.get('variational', False):
         from daart.callbacks import AnnealHparam
         callbacks.append(AnnealHparam(
-            hparams=model.hparams, key='kl_weight', epoch_start=0, epoch_end=100))
+            hparams=model.hparams, key='kl_weight', epoch_start=0, epoch_end=100, val_end=model.hparams['kl_weight']))
+        
+    # callback for uniform KL loss
+    from daart.callbacks import AnnealHparam
+    callbacks.append(AnnealHparam(
+        hparams=model.hparams, key='kl_y_weight_uniform', epoch_start=500, epoch_end=1000, val_start=model.hparams['kl_y_weight_uniform'], val_end=10))
+    
 
     # -------------------------------------
     # train model + cleanup

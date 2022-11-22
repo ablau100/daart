@@ -75,7 +75,7 @@ class EarlyStopping(BaseCallback):
 class AnnealHparam(BaseCallback):
     """Linearly increase value in an hparam dict."""
 
-    def __init__(self, hparams, key, epoch_start, epoch_end, val_start=0):
+    def __init__(self, hparams, key, epoch_start, epoch_end, val_start=0, val_end=0):
         """
 
         Parameters
@@ -101,18 +101,25 @@ class AnnealHparam(BaseCallback):
         self.key = key
         self.epoch_start = epoch_start
         self.epoch_end = epoch_end
+        
+        # check increase or decrease
+        self.increase = val_start <= val_end
+        
+        # init params
         self.val_start = val_start
-        self.val_end = self.hparams[self.key]
+        self.val_end = val_end
         self.hparams[self.key] = self.val_start
 
     def on_epoch_end(self, data_generator, model, trainer, **kwargs):
+        
         if trainer.curr_epoch < self.epoch_start:
             self.hparams[self.key] = self.val_start
         elif trainer.curr_epoch > self.epoch_end:
             self.hparams[self.key] = self.val_end
         else:
             frac = (trainer.curr_epoch - self.epoch_start) / (self.epoch_end - self.epoch_start)
-            self.hparams[self.key] = self.val_end * frac
+            self.hparams[self.key] = self.val_start + (self.val_end - self.val_start)* frac
+            
 
 
 class PseudoLabels(BaseCallback):

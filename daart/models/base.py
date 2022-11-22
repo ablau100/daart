@@ -344,19 +344,19 @@ class BaseInference(BaseModel):
             raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_inference'])
 
         # build classifier: q(y|x)
-#         self.model['qy_x'] = Module(
-#             self.hparams, 
-#             type='decoder',
-#             in_size=self.hparams['input_size'], 
-#             hid_size=self.hparams['n_hid_units'], 
-#             out_size=self.hparams['n_total_classes'])
+        self.model['qy_x'] = Module(
+            self.hparams, 
+            type='decoder',
+            in_size=self.hparams['input_size'], 
+            hid_size=self.hparams['n_hid_units'], 
+            out_size=self.hparams['n_total_classes'])
 
 
-        self.model['qy_x'] = self._build_linear(
-            global_layer_num=0, name='qy_x',
-            in_size=self.hparams['input_size'], out_size=self.hparams['n_total_classes'])
+#         self.model['qy_x'] = self._build_linear(
+#             global_layer_num=0, name='qy_x',
+#             in_size=self.hparams['input_size'], out_size=self.hparams['n_total_classes'])
 
-        self.hparams['qy_x_temperature'] = 1#torch.tensor([1]).to(device=self.hparams['device'])
+        #self.hparams['qy_x_temperature'] = 100#torch.tensor([1]).to(device=self.hparams['device'])
 
         # build encoder: q(z|x,y)
         self.model['encoder'] = Module(
@@ -416,6 +416,7 @@ class BaseInference(BaseModel):
         # initialize and sample q(y|x) (should be a one-hot vector)
         qy_x_probs = nn.Softmax(dim=2)(y_logits)
         qy_x_logits = y_logits
+        #print('q probs', qy_x_probs)
         qy_x = RelaxedOneHotCategorical(temperature=self.hparams['qy_x_temperature'], logits=qy_x_logits)
 
         y_sample = qy_x.rsample()  # (n_sequences, sequence_length, n_total_classes)

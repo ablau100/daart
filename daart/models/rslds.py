@@ -156,9 +156,9 @@ class RSLDSGenerative(BaseModel):
         
 #         r = torch.tensor([-34.4430,  -5.5914,  21.5151,  18.5194])
         
-        for i, module in enumerate(self.model['pz_t_mean']):
-            module.weight = nn.Parameter(As)
-            module.bias = nn.Parameter(bs)
+#         for i, module in enumerate(self.model['pz_t_mean']):
+#             module.weight = nn.Parameter(As)
+#             module.bias = nn.Parameter(bs)
         
 #         for i, module in enumerate(self.model['py_t_probs']):
 #             module.weight = nn.Parameter(R)
@@ -559,6 +559,23 @@ class RSLDS(BaseModel):
         
         #print('y samp', torch.argmax(inf_outputs['y_mixed'], axis=2))
         
+        print('')
+        print('y pred prop- qy ')
+        for i in range(inf_outputs['qy_x_probs'].shape[0]):
+            #print('yd', inf_outputs['y_mixed'][i].shape)
+            y_sums = torch.argmax(inf_outputs['qy_x_probs'][i], axis=1)
+            #print('ys', y_sums, y_sums.shape)
+            y_prop = []
+            bot = inf_outputs['qy_x_probs'].shape[1]
+            for k in range(self.hparams['n_total_classes']):
+                top = (y_sums[y_sums == k]).shape[0]
+                y_prop.append(round(top/bot, 3))
+            
+            print( y_prop)
+        
+        
+        print('')
+        
         gen_outputs = self.generative(**gen_inputs)
 
         # merge the two outputs
@@ -597,17 +614,6 @@ class RSLDS(BaseModel):
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
         
-#         # remove labels for specific classes
-#         for i in range(labels_wpad.shape[0]):
-#             labels_wpad[i][labels_wpad[i]==2] = -1
-#             labels_wpad[i][labels_wpad[i]==3] = -1
-
-
-        # remove all labels 
-        for i in range(labels_wpad.shape[0]):
-            labels_wpad[i]= -1
-
-            
 #         # remove half of labels randomly by class
         
 #         to_r = np.random.uniform(0,1,labels_wpad.shape)
@@ -619,6 +625,28 @@ class RSLDS(BaseModel):
 #                 labels_wpad[i][to_r[i] < 0.5] = -1
             
 #                 #print('post', labels_wpad[i])
+        
+        # remove labels for specific classes
+        for i in range(labels_wpad.shape[0]):
+            labels_wpad[i][labels_wpad[i]==0] = -1
+            #labels_wpad[i][labels_wpad[i]==3] = -1
+
+
+#         # remove all labels 
+#         #print(labels_wpad.shape)
+#         for i in range(labels_wpad.shape[0]):
+#             y_prop = []
+#             bot = labels_wpad.shape[1]
+#             for k in range(self.hparams['n_total_classes']):
+#                 top = (labels_wpad[i][labels_wpad[i] == k]).shape[0]
+#                 y_prop.append(round(top/bot, 3))
+            
+#             print('y prop', y_prop)
+            
+#             labels_wpad[i]= -1
+
+            
+        
 
   
         outputs_dict = self.forward(markers_wpad, labels_wpad)
@@ -748,25 +776,67 @@ class RSLDS(BaseModel):
         # compute kl loss between q(y_t|x_(T_t) and p(y_1) for all
         # ----------------------------------------------------------------------------------
         
-        # create classifier q(y_t|x_t) 
-        qy_logits = outputs_dict_rs['qy_x_logits']
-        qy = Categorical(logits=qy_logits)
+        # check that we have unlabeled observatios
+        if True:#idxs_labeled.sum() < idxs_labeled.shape[0]:
+            print('')
+            print('y pred prop- qy loss ')
 
-        # create prior p(y)
-        #py_logits = torch.tensor([.1,.1, .4, .4])
+            #y_sums = torch.argmax(outputs_dict_rs['qy_x_probs'][idxs_labeled == 0, :], axis=1)
+            y_sums = torch.argmax(outputs_dict_rs['qy_x_probs'], axis=1)
+            #print('ysum', y_sums)
+            y_prop = []
+            #bot = outputs_dict_rs['qy_x_probs'][idxs_labeled == 0, :].shape[0]
+            bot = outputs_dict_rs['qy_x_probs'].shape[0]
+            for k in range(self.hparams['n_total_classes']):
+                top = (y_sums[y_sums == k]).shape[0]
+                y_prop.append(round(top/bot, 3))
 
-        py_logits = torch.tensor([-1.09861, -1.09861, -1.09861, -1.09861])#outputs_dict_rs['py_logits'][0]
-        py = Categorical(logits=py_logits) 
+            print( y_prop)
 
-        #py = Categorical(py_logits)
 
-        loss_y_kl_uniform = torch.mean(kl_divergence(qy, py), axis=0) 
-        loss_y_kl_uniform = loss_y_kl_uniform * self.hparams['kl_y_weight_uniform']
+            print('')
+        
+        
+            # create classifier q(y_t|x_t) 
+            qy_logits = outputs_dict_rs['qy_x_logits'] # (n_seq * seq_length, n_classes)
+            qy = Categorical(logits=qy_logits)
 
-        loss += loss_y_kl_uniform * 100
+            # create prior p(y)
+            #py_logits = torch.tensor([.1,.1, .4, .4])
 
-        loss_dict['loss_y_kl_uniform'] = loss_y_kl.item()
-        #print('kl y loss', loss_y_kl)
+            #py_logits = torch.tensor([-1.09861, -1.09861, -1.09861, -1.09861])#outputs_dict_rs['py_logits'][0]
+
+            # init biased py prior
+    #         py_logits = torch.zeros_like(qy_logits)
+
+    #         priors = torch.tensor([[1.09861, -2.3979, -2.3979, -2.3979],
+    #                                [-2.3979, 1.09861, -2.3979, -2.3979],
+    #                                [-2.3979, -2.3979, 1.09861, -2.3979],
+    #                                [-2.3979, -2.3979, -2.3979, 1.09861]])
+
+    #         rands = torch.randint(0, 4, [py_logits.shape[0]])
+    #         for i in range(py_logits.shape[0]):
+    #             py_logits[i] = priors[rands[i]]
+
+            #ynp = [1-y for y in y_prop]
+            #py_logits = torch.tensor(ynp)
+            #py_logits = torch.log((py_logits/(1-py_logits)))
+            py_logits = torch.tensor([.5, .167, .167, .167])
+            py = Categorical(py_logits) 
+
+            #py = Categorical(py_logits)
+            print('var', torch.var(py_logits))
+            loss_y_kl_uniform = torch.mean(kl_divergence(qy, py), axis=0) #* torch.var(py_logits)
+            loss_y_kl_uniform = loss_y_kl_uniform * self.hparams['kl_y_weight_uniform']
+
+            print('')
+            print('kl weight', self.hparams['kl_y_weight_uniform'])
+            print('kl lossl', loss_y_kl_uniform)
+
+            loss += loss_y_kl_uniform
+
+            loss_dict['loss_y_kl_uniform'] = loss_y_kl.item()
+            #print('kl y loss', loss_y_kl)
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y
