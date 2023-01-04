@@ -187,6 +187,10 @@ class BaseModel(nn.Module):
         results_dict['markers'] = [[] for _ in range(data_generator.n_datasets)]
         for sess, dataset in enumerate(data_generator.datasets):
                 results_dict['markers'][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
+                
+        results_dict['labels_strong'] = [[] for _ in range(data_generator.n_datasets)]
+        for sess, dataset in enumerate(data_generator.datasets):
+                results_dict['labels_strong'][sess] = [np.array([]) for _ in range(dataset.n_sequences)]
 
         
         for key in keys:
@@ -210,14 +214,22 @@ class BaseModel(nn.Module):
                     for key, val in outputs_dict.items():
                         outputs_dict[key] = val[:, pad:-pad] if val is not None else None
                     data['markers'] = data['markers'][:, pad:-pad] 
+                    data['labels_strong'] = data['labels_strong'][:, pad:-pad]
                     #print('data 2', data['markers'].shape)
                 # loop over sequences in batch
                 for s, sess in enumerate(sess_list):
                     batch_idx = data['batch_idx'][s].item()
+                    
                     results_dict['markers'][sess][batch_idx] = \
                     data['markers'][s].cpu().detach().numpy()
+                    
+                    results_dict['labels_strong'][sess][batch_idx] = \
+                    data['labels_strong'][s].cpu().detach().numpy()
+                    
+                    #print('lab', data['labels_strong'], data['labels_strong'][s].cpu().detach().numpy().shape)
+                    
                     for key in keys:
-                        
+                        #print('key', key)
                         # push through log-softmax, since this is included in the loss and not model
                         results_dict[key][sess][batch_idx] = \
                         outputs_dict[key][s].cpu().detach().numpy()
@@ -423,24 +435,40 @@ class BaseInference(BaseModel):
         #print('ysamp inf', y_sample)
         # make ground truth y into onehot
         y_onehot = torch.zeros([y.shape[0], y.shape[1], self.hparams['n_total_classes']], device=y_logits.device)
-        for s in range(y.shape[0]):
-            for i in range(y.shape[1]):
-                if y[s][i] != self.hparams.get('ignore_class', 0):
-                    #print('y here', y[s][i].unsqueeze(0))
-                    one_hot = MakeOneHot()(y[s][i].unsqueeze(0), self.hparams['n_total_classes'])
-                    y_onehot[s][i] = one_hot
-                else:
-                    y_onehot[s][i] = torch.zeros(self.hparams['n_total_classes'])
+        
+        if self.hparams.get('ignore_class', 0) != 0:
+            for s in range(y.shape[0]):
+                for i in range(y.shape[1]):
+                    if y[s][i] != self.hparams.get('ignore_class', 0):
+                        #print('y here', y[s][i].unsqueeze(0))
+                        one_hot = MakeOneHot()(y[s][i].unsqueeze(0), self.hparams['n_total_classes'])
+                        y_onehot[s][i] = one_hot
+                    else:
+                        y_onehot[s][i] = torch.zeros(self.hparams['n_total_classes'])
+
+        else:
+            for s in range(y.shape[0]):
+                #print(y[s].shape)
+                y_onehot[s] = MakeOneHot()(y[s], self.hparams['n_total_classes'])           
 
         # init y_mixed, which will contain true labels for labeled data, samples for unlabled data
         y_mixed = y_onehot.clone().detach()  # (n_sequences, sequence_length, n_total_classes)
+        
+        
         # loop over sequences in batch
         idxs_labeled = torch.zeros_like(y)
-        for s in range(y_mixed.shape[0]):
-            for i in range(y_mixed.shape[1]):
-                idxs_labeled[s][i] = y[s][i] != self.hparams.get('ignore_class', 0)
-                if idxs_labeled[s][i] == 0:
-                    y_mixed[s, i, :] = y_sample[s, i]
+        if self.hparams.get('ignore_class', 0) != 0:
+            for s in range(y_mixed.shape[0]):
+                for i in range(y_mixed.shape[1]):
+                    idxs_labeled[s][i] = y[s][i] != self.hparams.get('ignore_class', 0)
+                    if idxs_labeled[s][i] == 0:
+                        y_mixed[s, i, :] = y_sample[s, i]
+
+        else:
+            for s in range(y_mixed.shape[0]):
+                idxs_labeled[s] = y[s] != self.hparams.get('ignore_class', 0)
+                y_mixed[s][idxs_labeled[s] == 0] = y_sample[s][idxs_labeled[s] == 0]
+                    
         
         # concatenate sample with input x
         # (n_sequences, sequence_length, n_total_classes))
