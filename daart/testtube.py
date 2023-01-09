@@ -109,5 +109,6 @@ def clean_tt_dir(hparams):
     version_dir = hparams['tt_version_dir']
     subdirs = get_subdirs(version_dir)
     for subdir in subdirs:
-        shutil.rmtree(os.path.join(version_dir, subdir))
+        if 'diagnostic' not in subdir: 
+            shutil.rmtree(os.path.join(version_dir, subdir))
     os.remove(os.path.join(version_dir, 'meta.experiment'))

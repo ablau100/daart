@@ -273,7 +273,7 @@ class Trainer(object):
         self.val_check_batch = None
         self.should_halt = False
 
-    def fit(self, model, data_generator, save_path):
+    def fit(self, model, data_generator, save_path, data_gen_test=None):
         """Fit pytorch models with stochastic gradient descent and early stopping.
 
         Training parameters such as min/max epochs are specified in the class constructor.
@@ -313,9 +313,16 @@ class Trainer(object):
         # -----------------------------------
         # set up training
         # -----------------------------------
+        
         # optimizer setup
         optimizer = torch.optim.Adam(
             model.get_parameters(), lr=self.learning_rate, weight_decay=self.l2_reg, amsgrad=True)
+        
+#         optimizer = torch.optim.Adam(
+#             model.get_parameters(), lr=self.learning_rate, weight_decay=self.l2_reg, amsgrad=True)
+        
+        # lr scheduler setup
+        #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
 
         # logging setup
         logger = Logger(n_datasets=data_generator.n_datasets, save_path=save_path)
@@ -352,7 +359,7 @@ class Trainer(object):
 
             i_batch = 0
             for i_batch in range(data_generator.n_tot_batches['train']):
-
+                #print('batch')
                 if i_epoch > 0:
                     self.curr_batch += 1
 
@@ -376,6 +383,7 @@ class Trainer(object):
                 # step (evaluate untrained network on epoch 0)
                 if i_epoch > 0:
                     optimizer.step()
+                   # scheduler.step()
 
                 # --------------------------------------
                 # check validation according to schedule
@@ -470,6 +478,13 @@ class Trainer(object):
             logger.create_metric_row(
                 'test', i_epoch, i_test, datasets[0], trial=data['batch_idx'][0].item(),
                 by_dataset=True)
+            
+        # compute metrics on entire train set and held-out test set
+        from daart.eval import get_all_diagnostics
+        #get_all_diagnostics(model, model.hparams, data_generator, os.path.join('/home/bsb2144/daart'))
+        #get_all_diagnostics(model, model.hparams, data_generator, os.path.join(model.hparams['tt_version_dir'], 'diagnostics_train')) 
+        
+        #get_all_diagnostics(model, model.hparams, data_gen_test, os.path.join(model.hparams['tt_version_dir'], 'diagnostics_test'))
 
         # save out hparams
         if save_path is not None:

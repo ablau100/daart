@@ -22,8 +22,223 @@ from torch.distributions.normal import Normal
 from torch.distributions.kl import kl_divergence
 
 
+class RSLDSGenerative(BaseModel):
+    """
+    Generative model for rSLDS
+    """
+    
+    def __init__(self, hparams, model):
+        """
+        
+        Parameters
+        ----------
+        hparams : dict
+            
+        """
+        super().__init__()
+        self.hparams = hparams
+        self.model = model
+    
+    def build_model(self):
+        """Construct the generative netowork using hparams."""
+        
+        """
+        Notation guide:
+        py_1 := p(y_1)
+        pz_1 := p(z_1)
+        
+        px_t := p(x_t|z_t)
+        py_t := p(y_t|y_(t-1), z_(t-1)), t > 1
+        pz_t := p(z_t|z_(t-1), y_t), t > 1
+        
+        """
 
-class RSLDS(BaseModel):
+        # select backbone network for geneative model
+        if self.hparams['backbone_generative'].lower() == 'temporal-mlp':
+            from daart.backbones.temporalmlp import TemporalMLP as Module
+        elif self.hparams['backbone_generative'].lower() == 'tcn':
+            raise NotImplementedError('deprecated; use dtcn instead')
+        elif self.hparams['backbone_generative'].lower() == 'dtcn':
+            from daart.backbones.tcn import DilatedTCN as Module
+        elif self.hparams['backbone_generative'].lower() in ['lstm', 'gru']:
+            from daart.backbones.rnn import RNN as Module
+        elif self.hparams['backbone_generative'].lower() == 'tgm':
+            raise NotImplementedError
+        else:
+            raise ValueError('"%s" is not a valid backbone network' % self.hparams['backbone_generative'])
+
+        # build label prior: p(y_1)
+        logits = []
+        
+        prob = (1/self.hparams['n_total_classes'])
+        val = float(np.log((prob/(1-prob))))
+        for k in range(self.hparams['n_total_classes']):
+            logits.append(val)
+        
+        self.hparams['py_1_logits'] = logits
+        
+        # build updated label prior: p(y_t|y_(t-1), z_(t-1)), t > 1
+        self.model['py_t_probs'] = self._build_linear(
+            0, 'py_t_probs', self.hparams['n_hid_units'], self.hparams['n_total_classes'])
+        
+        # build latent prior: p(z_1)
+        self.hparams['pz_1_mean'] = [0,1]
+        self.hparams['pz_1_logvar'] = -9.21
+        
+        # build latent_generator: p(z_t|z_(t-1), y_t)
+        self.model['pz_t_mean'] = self._build_linear(
+            0, 'pz_t_mean', self.hparams['n_hid_units'], (self.hparams['n_hid_units']*self.hparams['n_total_classes']))
+        
+        self.model['pz_t_logvar'] = self._build_linear(
+            0, 'pz_t_logvar', self.hparams['n_total_classes'], self.hparams['n_hid_units'])
+        
+        # build decoder: p(x_t|z_t)
+        self.model['decoder'] = self._build_linear(
+            0, 'decoder', self.hparams['n_hid_units'], self.hparams['input_size'])
+        
+        As = torch.tensor(
+             [[ 9.80436447e-01, -1.30991746e-01],
+             [ 1.27755862e-01,  9.88280774e-01],
+             [ 9.87511608e-01, -6.56728202e-02],
+             [ 6.21772981e-02,  9.93775794e-01],
+             [ 9.93601840e-01,  1.04869992e-03],
+             [ 6.04993083e-04,  9.87245556e-01],
+             [ 9.94231254e-01, -2.44135927e-04],
+             [-1.31332387e-03,  9.86318472e-01]])
+
+        bs = torch.tensor([ 0.16618703, -0.30929626, -0.01083673,  0.08616756,  0.10652665, -0.01280473,
+     -0.24733377,  0.01513071])
+        
+        
+#         R = torch.tensor([[ 20.5312,   2.1907],
+#         [-19.4506,  -2.1242],
+#         [ -0.3354,  -2.3760],
+#         [ -0.7452,   2.3095]])
+        
+#         r = torch.tensor([-34.4430,  -5.5914,  21.5151,  18.5194])
+        
+#         for i, module in enumerate(self.model['pz_t_mean']):
+#             module.weight = nn.Parameter(As)
+#             module.bias = nn.Parameter(bs)
+        
+#         for i, module in enumerate(self.model['py_t_probs']):
+#             module.weight = nn.Parameter(R)
+#             module.bias = nn.Parameter(r)
+            
+            
+            
+        
+        
+    def __str__(self):
+        """Pretty print generative model architecture."""
+        
+        format_str = 'Generative network architecture: %s\n' % self.hparams['backbone_generative'].upper()
+        format_str += '------------------------\n'
+
+#         if 'decoder' in self.model:
+#             format_str += 'Decoder (p(x_t|z_t)):\n'
+#             for i, module in enumerate(self.model['decoder'].model):
+#                 format_str += str('    {}: {}\n'.format(i, module))
+#             format_str += '\n'
+
+        if 'py_t_probs' in self.model:
+            format_str += 'p(y_t|y_(t-1), z_(t-1)):\n'
+            for i, module in enumerate(self.model['py_t_probs']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                format_str += str(' Weights py: {}\n'.format(module.weight))
+                format_str += str(' bias py: {}\n'.format(module.bias))
+            format_str += '\n'
+                
+        if 'pz_t_mean' in self.model:
+            format_str += 'p(z_t|z_(t-1), y_t) mean:\n'
+            for i, module in enumerate(self.model['pz_t_mean']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                format_str += str(' Weights pz: {}\n'.format(module.weight))
+                format_str += str(' bias pz: {}\n'.format(module.bias))
+            
+                
+#         if 'pz_t_logvar' in self.model:
+#             format_str += 'p(z_t|z_(t-1), y_t) logvar:\n'
+#             for i, module in enumerate(self.model['pz_t_logvar']):
+#                 format_str += str('    {}: {}\n'.format(i, module))
+
+        return format_str
+    
+    def forward(self, **kwargs): 
+        
+        """
+        forward function for rSLDS generative model
+        kwargs['z_sample']: (n_sequences, sequence_length, embedding_dim)
+        kwargs['y_sample']: (n_sequences, sequence_length, n_total_classes)
+        
+        """
+        
+        z_input = kwargs['z_sample']
+        y_input = kwargs['y_sample']
+        y_dim = self.hparams['n_total_classes']
+        
+        # reshape z to have an extra dim of length y_dim
+        z_with_y_dim = z_input.unsqueeze(2).repeat(1, 1, y_dim, 1)
+        
+        # create z_(t-1) and z_(t+1) tensors
+        z_t_skip_first = z_input[:, 1:, :]
+        z_t_skip_first_with_y_dim = z_t_skip_first.unsqueeze(2).repeat(1, 1, y_dim, 1)
+        
+        z_t_skip_last = z_input[:, :-1, :]
+        z_t_skip_last_with_y_dim = z_t_skip_last.unsqueeze(2).repeat(1, 1, y_dim, 1)
+        
+        # create y_(t-1) and y_(t+1) tensors
+        y_t_skip_first = y_input[:, 1:, :]
+        y_t_skip_last = y_input[:, :-1, :]
+        
+        # push z_(t-1) through generative model to get parameters of p(y_t|y_(t-1), z_(t-1))
+        py_t_logits = self.model['py_t_probs'](z_t_skip_last)
+        
+        # concat py_1 with py_t, t > 1
+        py_1_logits = torch.tensor(self.hparams['py_1_logits'])
+        
+        py_logits = torch.zeros(py_t_logits.shape[0], py_t_logits.shape[1]+1, py_t_logits.shape[2]).to(device=self.hparams['device'])
+        py_logits[:, 1:, :] = py_t_logits 
+        py_logits[:, 0, :] = py_1_logits
+        
+        # push y_t and z_(t-1) through generative model to get parameters of p(z_t|z_(t-1), y_t)
+        pz_t_mean = self.model['pz_t_mean'](z_t_skip_last)
+        pz_t_mean = torch.reshape(pz_t_mean, (pz_t_mean.shape[0], pz_t_mean.shape[1], y_dim,-1))
+
+        
+        pz_t_logvar = self.model['pz_t_logvar'](y_t_skip_first)
+        
+        
+        # index mean by y_t - z_t starts from t=1, so our indexer y starts from y=1
+        pz_indexer = y_t_skip_first.argmax(2,True).unsqueeze(-1).expand(*(-1,)*y_t_skip_first.ndim, pz_t_mean.shape[3])
+        pz_t_mean = torch.gather(pz_t_mean, 2, pz_indexer).squeeze(2)
+        
+        # concat pz_1 mean with pz_t mean , t > 1
+        pz_1_mean = torch.tensor(self.hparams['pz_1_mean'])
+        pz_mean = torch.zeros(pz_t_mean.shape[0], pz_t_mean.shape[1]+1, pz_t_mean.shape[2]).to(device=self.hparams['device'])
+        
+        pz_mean[:, 1:, :] = pz_t_mean
+        pz_mean[:, 0, :] = pz_1_mean
+        
+        # concat pz_1 logvar with pz_t logvar , t > 1
+        pz_1_logvar = torch.tensor(self.hparams['pz_1_logvar'])
+        pz_logvar = torch.zeros(pz_t_mean.shape[0], pz_t_mean.shape[1]+1, pz_t_mean.shape[2]).to(device=self.hparams['device'])
+        pz_logvar[:, 1:, :] = pz_t_logvar
+        pz_logvar[:, 0, :] = pz_1_logvar
+       
+        # push sampled z from through decoder to get reconstruction
+        # this will be the mean of p(x_t|z_t)
+        x_hat = self.model['decoder'](z_input)
+
+        return {
+            'py_logits': py_logits, # (n_sequences, sequence_length, n_total_classes)
+            'pz_mean': pz_mean,  # (n_sequences, sequence_length, embedding_dim)
+            'pz_logvar': pz_logvar,  # (n_sequences, sequence_length, embedding_dim)
+            'reconstruction': x_hat,  # (n_sequences, sequence_length, n_markers)
+        }
+
+
+class RSLDSS(BaseModel):
     """rSLDS Model.
     
     [insert arxiv link here]
@@ -55,10 +270,8 @@ class RSLDS(BaseModel):
             
         self.hparams = hparams
         
-        self.keys = ['qy_x_probs']
-        
-#         self.keys = ['qy_x_probs','qz_xy_mean','qz_xy_logvar'
-#                 ,'pz_mean','pz_logvar','reconstruction']
+        self.keys = ['qy_x_probs','y_sample','qz_xy_mean','qz_xy_logvar'
+                ,'pz_mean','pz_logvar','reconstruction']
 
         # model dict will contain some or all of the following components:
         # - classifier: q(y|x) [weighted by hparams['lambda_strong'] on labeled data]
@@ -67,11 +280,10 @@ class RSLDS(BaseModel):
         # - latent_generator: p(z|y)
 
         self.model = nn.ModuleDict()
-#         self.inference = BaseInference(hparams, self.model)
-#         self.generative = RSLDSGenerative(hparams, self.model)
+        self.inference = BaseInference(hparams, self.model)
+        self.generative = RSLDSGenerative(hparams, self.model)
         
-        self.inference = RSLDSMInference(hparams, self.model)
-        self.generative = RSLDSMGenerative(hparams, self.model)
+        
         
         self.build_model()
 
@@ -188,7 +400,8 @@ class RSLDS(BaseModel):
 
         self.inference.build_model()
         self.generative.build_model()
-    
+
+
     def forward(self, x, y):
         """Process input data.
         
@@ -217,22 +430,39 @@ class RSLDS(BaseModel):
         
         inf_outputs = self.inference(x, y)
         
+        # generative input
         gen_inputs = {
-           'y_probs': inf_outputs['qy_x_probs'],
+           'y_sample': inf_outputs['y_mixed'],
            'z_sample': inf_outputs['z_xy_sample'], 
-           'idxs_labeled': inf_outputs['idxs_labeled']
         }
- 
+        
+#         gen_inputs = {
+#            'y_probs': inf_outputs['qy_x_probs'],
+#            'z_sample': inf_outputs['z_xy_sample'], 
+#            'idxs_labeled': inf_outputs['idxs_labeled']
+#         }
+        
+        
+#         print('')
+#         print('y pred prop- qy ')
+#         for i in range(inf_outputs['qy_x_probs'].shape[0]):
+#             #print('yd', inf_outputs['y_mixed'][i].shape)
+#             y_sums = torch.argmax(inf_outputs['qy_x_probs'][i], axis=1)
+#             #print('ys', y_sums, y_sums.shape)
+#             y_prop = []
+#             bot = inf_outputs['qy_x_probs'].shape[1]
+#             for k in range(self.hparams['n_total_classes']):
+#                 top = (y_sums[y_sums == k]).shape[0]
+#                 y_prop.append(round(top/bot, 3))        
+#             print( y_prop)       
+#         print('')
+        
         gen_outputs = self.generative(**gen_inputs)
 
         # merge the two outputs
         output_dict = {**inf_outputs, **gen_outputs}
 
         return output_dict
-    
-    def get_expectation(self, values, probs):
-        expectation = torch.sum(values*probs, axis=1)
-        return expectation
     
     def training_step(self, data, accumulate_grad=True, **kwargs):
         """Calculate negative log-likelihood loss for supervised models.
@@ -255,7 +485,6 @@ class RSLDS(BaseModel):
         # define hyperparams
         kl_y_weight = self.hparams.get('kl_y_weight', 100)
         lambda_strong = self.hparams.get('lambda_strong', 1)
-        ignore_class = self.hparams.get('ignore_class', 0)
        # print('ls: ', lambda_strong)
         kl_weight = self.hparams.get('kl_weight', 1)
 
@@ -266,12 +495,17 @@ class RSLDS(BaseModel):
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
         
-#         # remove half of labels randomly by class     
+#         # remove half of labels randomly by class
+        
 #         to_r = np.random.uniform(0,1,labels_wpad.shape)
         
 #         for i in range(labels_wpad.shape[0]):
-#                 labels_wpad[i][to_r[i] < 0.5] = -1
 
+#                 #print('pre', labels_wpad[i])
+
+#                 labels_wpad[i][to_r[i] < 0.5] = -1
+            
+#                 #print('post', labels_wpad[i])
         
 #         # remove labels for specific classes
 #         for i in range(labels_wpad.shape[0]):
@@ -280,6 +514,7 @@ class RSLDS(BaseModel):
 
 
         # remove all labels 
+        #print(labels_wpad.shape)
 #         for i in range(labels_wpad.shape[0]):
 #             y_prop = []
 #             bot = labels_wpad.shape[1]
@@ -291,9 +526,11 @@ class RSLDS(BaseModel):
             
 #             labels_wpad[i]= -1
 
+            
+        
 
+  
         outputs_dict = self.forward(markers_wpad, labels_wpad)
-        #print('ot log p ', outputs_dict['pz_logvar'].shape)
 
         # remove padding from supplied data
         if pad > 0:
@@ -302,16 +539,11 @@ class RSLDS(BaseModel):
             labels_strong = data['labels_strong']
         
         # remove padding from model output
-        y_dim = self.hparams['n_total_classes']
-        
         if pad > 0:
             markers = markers_wpad[:, pad:-pad, ...]
             # remove padding from model output
             for key, val in outputs_dict.items():
-                if val.shape[0] != y_dim:
-                    outputs_dict[key] = val[:, pad:-pad, ...] if val is not None else None
-                else:
-                    outputs_dict[key] = val[:, :, pad:-pad, ...] if val is not None else None
+                outputs_dict[key] = val[:, pad:-pad, ...] if val is not None else None
         else:
             markers = markers_wpad
             
@@ -319,66 +551,29 @@ class RSLDS(BaseModel):
         N = markers.shape[0] * markers.shape[1]
         markers_rs = torch.reshape(markers, (N, markers.shape[-1]))
         labels_rs = torch.reshape(labels_strong, (N,))
-        
         outputs_dict_rs = {}
-        
-#         {
-#             *****RED****** 'py_logits': py_logits, # (n_total_classes, n_sequences, sequence_length, n_total_classes)
-#             *****RED****** 'pz_mean': pz_mean,  # (n_total_classes, n_sequences, sequence_length, n_total_classes, embedding_dim)
-#             'pz_logvar': pz_logvar,  # (n_sequences, sequence_length, n_total_classes, embedding_dim)
-#             *****RED****** 'reconstruction': x_hat,  # (n_total_classes, n_sequences, sequence_length, n_markers)
-#         }
-#         {
-#             'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
-#             'qy_x_probs': qy_x_probs,  # (n_sequences, sequence_length, n_classes)
-#             'qy_e_probs': qy_e_probs, # (n_sequences, sequence_length, n_classes)
-#             'qy_x_logits': qy_x_logits,  # (n_sequences, sequence_length, n_classes)
-    #             *****RED****** 'qz_xy_mean': `,  # (n_classes, n_sequences, sequence_length, embedding_dim)
-#            *****RED******  'qz_xy_logvar': qz_xy_logvar,  # (n_classes, n_sequences, sequence_length, embedding_dim)
-#             *****RED****** 'z_xy_sample': z_xy_sample, # (n_classes, n_sequences, sequence_length, embedding_dim)
-#             'idxs_labeled': idxs_labeled,  # (n_sequences, sequence_length)
-#         }
-        
-        # this will be an issue when ydim = batch size
-        
-        
         for key, val in outputs_dict.items():
-            
             if isinstance(val, torch.Tensor):
-                if val.shape[0] == y_dim:
-                    shape = (y_dim, N) + tuple(val.shape[3:])
-                    outputs_dict_rs[key] = torch.reshape(val, shape) 
-                elif len(val.shape) > 2:
-                    shape = (N, ) + tuple(val.shape[2:])
-                    outputs_dict_rs[key] = torch.reshape(val, shape)
+                if len(val.shape) > 2:
+                    outputs_dict_rs[key] = torch.reshape(val, (N, val.shape[-1]))
                 else:
                     # when the input is (n_sequences, sequence_length), we want the output to be (n_sequences * sequence_length)
                     outputs_dict_rs[key] = torch.reshape(val, (N, 1))
             else:
                 outputs_dict_rs[key] = val
-         
+                
         # pull out indices of labeled data for loss computation
         idxs_labeled = outputs_dict_rs['idxs_labeled'].squeeze(-1)
 
         # initialize loss to zero
         loss = 0
         loss_dict = {}
-        qy_e_probs = outputs_dict_rs['qy_e_probs']
         
         # ----------------------------------------------
         # compute classification loss on labeled data
         # ----------------------------------------------
         if lambda_strong > 0:
-            
-            py_logits = outputs_dict_rs['py_logits'][:, idxs_labeled > 0, :]
-
-            y_gt_scalar = labels_rs[labels_rs != ignore_class]
-            
-            py_logits_labeled = torch.zeros((py_logits.shape[1], py_logits.shape[2]))
-            for i, k in enumerate(y_gt_scalar):
-                py_logits_labeled[i] = py_logits[k, i, :]
-            
-            loss_strong = self.class_loss(py_logits_labeled, y_gt_scalar) * lambda_strong
+            loss_strong = self.class_loss(outputs_dict_rs['y_logits'], labels_rs) * lambda_strong
             
             loss += loss_strong
             # log
@@ -399,14 +594,7 @@ class RSLDS(BaseModel):
         k = markers_rs.shape[1]
         mvn_scalar =  (-1) * .5 * math.log(k)
         
-        # sum over marker dim
-        loss_reconstruction = torch.sum(px_z.log_prob(markers_rs), axis=2) 
-        
-        # take transpose to get shape N * y_dim
-        loss_reconstruction = torch.transpose(loss_reconstruction, 0, 1)
-        
-        # get expectation to get shape N
-        loss_reconstruction = self.get_expectation(loss_reconstruction, qy_e_probs)
+        loss_reconstruction = torch.sum(px_z.log_prob(markers_rs), axis=1) 
 
         # average over batch dim
         loss_reconstruction = (torch.mean(loss_reconstruction, axis=0) + mvn_scalar )* (-1)
@@ -416,28 +604,30 @@ class RSLDS(BaseModel):
         loss_dict['loss_reconstruction'] = loss_reconstruction.item()
         #print('loss recon: ', loss_reconstruction)
         
+        
         # -------------------------------------------------------
         # compute log p(y_t | y_(t-1), z_(t-1)) loss for labeled
         # -------------------------------------------------------
  
         # check for labeled data
         if idxs_labeled.sum() > 0:
+            py_logits = outputs_dict_rs['py_logits'][idxs_labeled > 0, :]
+            y_mixed = outputs_dict_rs['y_mixed']
+            y_mixed_scalar = torch.argmax(y_mixed, axis=1)[idxs_labeled > 0]
 
-            py = Categorical(logits=py_logits_labeled) 
+            py = Categorical(logits=py_logits) 
 
-            loss_py = torch.mean(py.log_prob(y_gt_scalar), axis=0) * (-1)
+            loss_py = torch.mean(py.log_prob(y_mixed_scalar), axis=0) * (-1)
 
             loss += loss_py
 
             # log
             loss_dict['loss_py'] = loss_py.item()
-
+           
+    
         # ----------------------------------------------------------------------------------
         # compute kl loss between q(y_t|x_(T_t) and p(y_t|y_(t-1), z_(t-1)) for unlabeled
         # ----------------------------------------------------------------------------------
-        
-         # 'py_logits': py_logits, # (n_total_classes, N, n_total_classes)
-         #     'y_logits': y_logits, # (N, n_classes)
         
         # check that we have unlabeled observatios
         if idxs_labeled.sum() < idxs_labeled.shape[0]:
@@ -447,112 +637,97 @@ class RSLDS(BaseModel):
             qy = Categorical(logits=qy_logits)
 
             # create prior p(y)
-            py_logits = outputs_dict_rs['py_logits'][:, idxs_labeled == 0, :]
+            py_logits = outputs_dict_rs['py_logits'][idxs_labeled == 0, :]
             py = Categorical(logits=py_logits) 
+            
+            #py = Categorical(py_logits)
 
-            loss_y_kl = torch.transpose(kl_divergence(qy, py), 0, 1)
-            #print('kl y loss', loss_y_kl.shape)
-            #print('e shape', qy_e_probs[idxs_labeled == 0].shape)
-            
-            # get expectation
-            expectation_probs = torch.vstack((torch.ones(y_dim)/y_dim, qy_e_probs[idxs_labeled == 0][:-1]))
-            
-            #print('expectation_probs', expectation_probs.shape, expectation_probs)
-            
-            loss_y_kl = self.get_expectation(loss_y_kl, qy_e_probs[idxs_labeled == 0])
-            
-            # mean over batch dim
-            loss_y_kl = torch.mean(loss_y_kl, axis=0)
-            
+            loss_y_kl = torch.mean(kl_divergence(qy, py), axis=0) 
             loss_y_kl = loss_y_kl * kl_y_weight
 
             loss += loss_y_kl * 10
 
             loss_dict['loss_y_kl'] = loss_y_kl.item()
             #print('kl y loss', loss_y_kl)
-         
+            
+            
         # ----------------------------------------------------------------------------------
         # compute kl loss between q(y_t|x_(T_t) and p(y_1) for all
         # ----------------------------------------------------------------------------------
         
-#         y_sums = torch.argmax(outputs_dict_rs['qy_x_probs'], axis=1)
-#         y_prop = []
-#         bot = outputs_dict_rs['qy_x_probs'].shape[0]
-#         for k in range(self.hparams['n_total_classes']):
-#             top = (y_sums[y_sums == k]).shape[0]
-#             y_prop.append(round(top/bot, 3))
+#         # check that we have unlabeled observatios
+#         if True:#idxs_labeled.sum() < idxs_labeled.shape[0]:
+#             #print('')
+#             #print('y pred prop- qy loss ')
 
-#         # create classifier q(y_t|x_t) 
-#         qy_logits = outputs_dict_rs['qy_x_logits'] # (n_seq * seq_length, n_classes)
-#         qy = Categorical(logits=qy_logits)
+#             #y_sums = torch.argmax(outputs_dict_rs['qy_x_probs'][idxs_labeled == 0, :], axis=1)
+#             y_sums = torch.argmax(outputs_dict_rs['qy_x_probs'], axis=1)
+#             #print('ysum', y_sums)
+#             y_prop = []
+#             #bot = outputs_dict_rs['qy_x_probs'][idxs_labeled == 0, :].shape[0]
+#             bot = outputs_dict_rs['qy_x_probs'].shape[0]
+#             for k in range(self.hparams['n_total_classes']):
+#                 top = (y_sums[y_sums == k]).shape[0]
+#                 y_prop.append(round(top/bot, 3))
 
-#         # create prior p(y)
-#         #py_logits = torch.tensor([.1,.1, .4, .4])
+#             #print( y_prop)
 
-#         #py_logits = torch.tensor([-1.09861, -1.09861, -1.09861, -1.09861])#outputs_dict_rs['py_logits'][0]
 
-#         # init biased py prior
-#         # py_logits = torch.zeros_like(qy_logits)
+#             #print('')
+        
+        
+#             # create classifier q(y_t|x_t) 
+#             qy_logits = outputs_dict_rs['qy_x_logits'] # (n_seq * seq_length, n_classes)
+#             qy = Categorical(logits=qy_logits)
 
-#         #py_logits = torch.tensor([1-y for y in y_prop])
-#         #py_logits = torch.tensor(ynp)
-#         #py_logits = torch.log((py_logits/(1-py_logits)))
+#             # create prior p(y)
+#             #py_logits = torch.tensor([.1,.1, .4, .4])
 
-#         #py_logits =  torch.tensor([.25, .25, .25, .25])
-#         #py_logits =  torch.tensor([.3, .2, .2, .3])
-#         #py = Categorical(py_logits) 
+#             #py_logits = torch.tensor([-1.09861, -1.09861, -1.09861, -1.09861])#outputs_dict_rs['py_logits'][0]
 
-#         loss_y_kl_uniform = torch.mean(kl_divergence(qy, py), axis=0) #* torch.var(py_logits)
-#         loss_y_kl_uniform = loss_y_kl_uniform * self.hparams['kl_y_weight_uniform']
+#             # init biased py prior
+#     #         py_logits = torch.zeros_like(qy_logits)
 
-#         loss += loss_y_kl_uniform
 
-#         loss_dict['loss_y_kl_uniform'] = loss_y_kl_uniform.item()
-#         #print('kl y loss', loss_y_kl)
+#             #py_logits = torch.tensor([1-y for y in y_prop])
+#             #py_logits = torch.tensor(ynp)
+#             #py_logits = torch.log((py_logits/(1-py_logits)))
+            
+            
+#             #py_logits =  torch.tensor([.25, .25, .25, .25])
+#             #py_logits =  torch.tensor([.3, .2, .2, .3])
+#             #py = Categorical(py_logits) 
+
+#             #py = Categorical(py_logits)
+#             #print('var', torch.var(py_logits))
+#             loss_y_kl_uniform = torch.mean(kl_divergence(qy, py), axis=0) #* torch.var(py_logits)
+#             loss_y_kl_uniform = loss_y_kl_uniform * self.hparams['kl_y_weight_uniform']
+
+# #             print('')
+# #             print('kl weight', self.hparams['kl_y_weight_uniform'])
+# #             print('kl lossl', loss_y_kl_uniform)
+
+#             loss += loss_y_kl_uniform
+
+#             loss_dict['loss_y_kl_uniform'] = loss_y_kl_uniform.item()
+            #print('kl y loss', loss_y_kl)
         
         # ----------------------------------------
         # compute kl divergence b/t qz_xy and pz_y
         # ----------------------------------------   
+        # build MVN p(z|y)
+        pz_mean = outputs_dict_rs['pz_mean']
+        pz_std = outputs_dict_rs['pz_logvar'].exp().pow(0.5)
+        pz = Normal(pz_mean, pz_std)
         
-#                 {
-            
-#             *****RED****** 'pz_mean': pz_mean,  # (n_total_classes, N, n_total_classes, embedding_dim)
-#             'pz_logvar': pz_logvar,  # (N, n_total_classes, embedding_dim)
-            
-#             'qy_e_probs': qy_e_probs, # (N, n_classes)
-
-#             *****RED****** 'qz_xy_mean': `,  # (n_classes, N, embedding_dim)
-#            *****RED******  'qz_xy_logvar': qz_xy_logvar,  # (n_classes, N, embedding_dim)
-
-#         }
+        # build MVN q(z|x,y)
+        qz_mean = outputs_dict_rs['qz_xy_mean']
+        qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)
+        qz = Normal(qz_mean, qz_std)
         
+        # sum over latent, mean over batch (mean?)
         
-        # loop over k-1
-        loss_z_kl = 0
-        for k_prime in range(y_dim):
-            for k in range(y_dim):
-        
-                # build MVN p(z|y)
-                pz_mean = outputs_dict_rs['pz_mean'][k_prime, :, k, :]
-                #print('pzm', pz_mean.shape)
-                pz_std = outputs_dict_rs['pz_logvar'].exp().pow(0.5)[:, k, :]
-
-                #print('pm', pz_mean.shape)
-                #print('pstd', pz_std.shape)
-                pz = Normal(pz_mean, pz_std)
-
-                # build MVN q(z|x,y)
-                qz_mean = outputs_dict_rs['qz_xy_mean'][k]
-                qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)[k]
-                qz = Normal(qz_mean, qz_std)
-
-                #print('qm', qz_mean.shape)
-                #print('qstd', qz_std.shape)
-                
-                # sum over latent, mean over batch
-                loss_z_kl_temp = torch.sum(kl_divergence(qz, pz), axis=1) 
-                loss_z_kl += torch.mean(loss_z_kl_temp, axis=0) 
-                #print('loss_z_kl', loss_z_kl.shape)
+        loss_z_kl = torch.mean(torch.sum(kl_divergence(qz, pz), axis=1), axis=0)
 
         loss += kl_weight * loss_z_kl
         # log
@@ -570,8 +745,5 @@ class RSLDS(BaseModel):
         loss_dict['loss'] = loss.item()
 
         return loss_dict
-    
-    
-    
     
 

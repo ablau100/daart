@@ -9,13 +9,138 @@ import seaborn as sns
 from sklearn.metrics import recall_score, precision_score
 from typeguard import typechecked
 from typing import List, Optional, Union
+import itertools
 
 from daart.io import make_dir_if_not_exists
 
 # to ignore imports for sphix-autoapidoc
-__all__ = ['get_precision_recall', 'int_over_union', 'run_lengths', 'plot_training_curves']
+__all__ = ['get_precision_recall', 'int_over_union', 'run_lengths', 'plot_training_curves', 'get_all_diagnostics']
 
+def confusion_matrix(true_states, inf_states, num_states):
+    confusion = np.zeros((num_states, num_states))
+    ztotal = np.zeros((num_states, 1))
+    for i in range(num_states):
+        for ztrue, zinf in zip(true_states, inf_states):
+            for j in range(num_states):
+                confusion[i, j] += np.sum((ztrue == i) & (zinf == j))
+            ztotal[i] += np.sum(ztrue==i)
+    return confusion / ztotal
 
+def get_all_diagnostics(model, hparams, data_gen, save_path):
+    
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    
+    start = 0
+    stop=500
+    # get model output
+    tmp = model.predict_labels(data_gen, return_scores=True)
+    y_hat = np.vstack(tmp['qy_x_probs'][0])
+#     z_hat = np.vstack(tmp['qz_xy_mean'][0])
+#     x_hat = np.vstack(tmp['reconstruction'][0])
+    
+#     x_gt = np.vstack(tmp['markers'][0])
+    y_gt = np.vstack(tmp['labels_strong'][0]).reshape(-1)
+    
+#     print('xhat', x_hat.shape)
+#     print('xgt', x_gt.shape)
+    
+    print('y_hat', y_hat.shape)
+    print('ygt', y_gt.shape)
+     
+#     # save reonstruction metrics
+#     mse = x_gt - x_hat # recon MSE
+#     mse = np.mean(mse*mse, axis=1)
+#     mse = np.mean(mse, axis=0)
+    
+#     nrow = int((x_gt.shape[1]+2)/2)
+    
+#     fig, axs = plt.subplots(nrows=nrow, ncols=2, figsize=(7, 10))
+
+#     i = 0
+#     for row in axs:
+#         for plot in row:
+#             if i >= x_gt.shape[1]:
+#                 break
+#             plot.set_title("Marker "+ str(i))
+#             plot.plot(np.arange(start,stop), x_gt[start:stop, i],color='blue',label='x')
+#             plot.plot(np.arange(start,stop), x_hat[start:stop, i],color='orange',label='reconstruction')
+#             if i >= (x_gt.shape[1]-2):
+#                 plot.set_xlabel("epoch")
+
+#             i+=1
+
+#     axs[0, 0].legend(loc='best')
+#     bar1 = axs[nrow-1][1].bar('MSE', [mse], width=1.04, color='red')
+#     axs[nrow-1][1].set_title("Recon MSE")
+
+#     axs[nrow-1][1].bar_label(bar1, fmt='%.3f', size = 15)
+#     axs[nrow-1][1].set_ylim(0,mse+0.5)
+#     fig.tight_layout()
+#     plt.savefig(os.path.join(save_path, 'recon_metrics.pdf'))
+    
+    # save classification metrics
+    # get F1
+    label_names = hparams['label_names']
+    #print('LNNN', label_names)
+    f1 = np.zeros(len(label_names))
+     
+    f1_groups = list(itertools.permutations(list(range(len(label_names)))))
+    
+    y_hat = np.argmax(y_hat, axis=1)
+    print('y_hat', y_hat.shape, y_hat[:120])
+    y_hat_best = np.zeros_like(y_hat)
+    #print('yhat', y_hat, y_hat.shape)
+    background = 0 if hparams['ignore_class']==0 else None
+    for perm in f1_groups:
+        y_hat_temp = np.ones_like(y_hat) * -1
+        for i in range(len(label_names)):
+            y_hat_temp[y_hat==i] = perm[i]
+        
+        #print('')
+        #print('ygt', y_gt, y_gt.shape)
+        #print('yp', y_hat_temp, y_hat_temp.shape)
+       
+        f1_temp = np.array(get_precision_recall(y_gt, y_hat_temp, background, len(label_names))['f1']).astype(float)
+        #print('f1temp', f1_temp)
+        #print('f1', f1)
+        if np.mean(f1_temp) > np.mean(f1):
+            f1 = f1_temp
+            y_hat_best = y_hat_temp
+    #print('F1', f1)
+    
+    f1s = list(f1)
+    
+    fig, axs = plt.subplots(nrows=1, ncols=2, figsize=(10, 5))
+    state_overlaps_all_0 = confusion_matrix(
+        y_gt, y_hat_best, num_states=len(label_names))
+
+    im = axs[0].imshow(state_overlaps_all_0[:, :], vmin=0, vmax=1, cmap='Reds')
+
+    axs[0].set_title('Confusion Matrix')
+
+    plt.sca(axs[0])
+    plt.xticks(range(len(label_names)), label_names, rotation=25)
+    plt.yticks(np.arange(len(label_names)), label_names)
+    plt.colorbar(im, ax=axs[0])
+
+    y_pos = np.arange(len(label_names)+1)
+    
+    hbars = axs[1].barh(y_pos, f1s+[sum(f1s)/len(f1s)], align='center')
+    axs[1].set_yticks(y_pos, labels=label_names + ['mean'])
+    axs[1].invert_yaxis()  # labels read top-to-bottom
+    axs[1].set_xlabel('F1')
+    axs[1].set_title('F1 scores')
+
+    # Label with specially formatted floats
+    axs[1].bar_label(hbars, fmt='%.3f')
+    axs[1].set_xlim(right=1.5)  # adjust xlim to fit labels
+
+    plt.savefig(os.path.join(save_path, 'class_metrics.pdf'))
+    
+    
+    
+    
 @typechecked
 def get_precision_recall(
         true_classes: np.ndarray,
@@ -180,7 +305,8 @@ def plot_training_curves(
 
     metrics_list = [
         'loss', 'loss_weak', 'loss_strong', 'loss_pred', 'loss_task', 'loss_kl', 'fc',
-        'loss_unlabeled', 'loss_reconstruction', 'loss_classifier', 'loss_entropy', 'loss_y_logprob', 'loss_y_kl', 'loss_z_kl'
+        'loss_unlabeled', 'loss_reconstruction', 'loss_classifier', 'loss_entropy', 'loss_y_logprob',
+        'loss_y_kl', 'loss_z_kl', 'loss_y_kl_uniform'
     ]
 
     metrics_dfs = [load_metrics_csv_as_df(metrics_file, metrics_list, expt_ids=expt_ids)]

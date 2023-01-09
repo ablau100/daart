@@ -11,14 +11,16 @@ from daart.transforms import ZScore
 __all__ = ['build_data_generator']
 
 
-def build_data_generator(hparams: dict) -> DataGenerator:
+def build_data_generator(hparams: dict, test: bool=False) -> DataGenerator:
     """Helper function to build a data generator from hparam dict."""
 
     signals = []
     transforms = []
     paths = []
-
-    for expt_id in hparams['expt_ids']:
+    
+    expt_ids = hparams['expt_ids_test'] if test else hparams['expt_ids']
+    #print('hp', hparams['expt_ids'])
+    for expt_id in expt_ids:
 
         signals_curr = []
         transforms_curr = []
@@ -40,8 +42,10 @@ def build_data_generator(hparams: dict) -> DataGenerator:
         paths_curr.append(markers_file)
 
         # hand labels
+        #print('dirs', hparams.get('expt_ids_to_keep', hparams['expt_ids']))
+        #print('test dirs', hparams['expt_ids_test'])
         if hparams.get('lambda_strong', 0) > 0:
-            if expt_id not in hparams.get('expt_ids_to_keep', hparams['expt_ids']):
+            if expt_id not in (hparams['expt_ids'] + hparams['expt_ids_test']):
                 hand_labels_file = None
             else:
                 hand_labels_file = os.path.join(
@@ -77,9 +81,10 @@ def build_data_generator(hparams: dict) -> DataGenerator:
     hparams['sequence_pad'] = compute_sequence_pad(hparams)
 
     # build data generator
+    seq_length = hparams['sequence_length']
     data_gen = DataGenerator(
         hparams['expt_ids'], signals, transforms, paths, device=hparams['device'],
-        sequence_length=hparams['sequence_length'], sequence_pad=hparams['sequence_pad'],
+        sequence_length=seq_length, sequence_pad=hparams['sequence_pad'],
         batch_size=hparams['batch_size'],
         trial_splits=hparams['trial_splits'], train_frac=hparams['train_frac'],
         input_type=hparams.get('input_type', 'markers'))
