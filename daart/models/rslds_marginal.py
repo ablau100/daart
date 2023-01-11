@@ -230,8 +230,8 @@ class RSLDSM(BaseModel):
 
         return output_dict
     
-    def get_expectation(self, values, probs):
-        expectation = torch.sum(values*probs, axis=1)
+    def get_expectation(self, values, probs, axis=1):
+        expectation = torch.sum(values*probs, axis=axis)
         return expectation
     
     def training_step(self, data, accumulate_grad=True, **kwargs):
@@ -266,11 +266,10 @@ class RSLDSM(BaseModel):
         markers_wpad = data['markers']
         labels_wpad = data['labels_strong']
         
-#         # remove half of labels randomly by class     
-#         to_r = np.random.uniform(0,1,labels_wpad.shape)
-        
-#         for i in range(labels_wpad.shape[0]):
-#                 labels_wpad[i][to_r[i] < 0.5] = -1
+        # remove half of labels randomly by class     
+        to_r = np.random.uniform(0,1,labels_wpad.shape)
+        for i in range(labels_wpad.shape[0]):
+                labels_wpad[i][to_r[i] < 0.5] = -1
 
         
 #         # remove labels for specific classes
@@ -322,23 +321,6 @@ class RSLDSM(BaseModel):
         
         outputs_dict_rs = {}
         
-#         {
-#             *****RED****** 'py_logits': py_logits, # (n_total_classes, n_sequences, sequence_length, n_total_classes)
-#             *****RED****** 'pz_mean': pz_mean,  # (n_total_classes, n_sequences, sequence_length, n_total_classes, embedding_dim)
-#             'pz_logvar': pz_logvar,  # (n_sequences, sequence_length, n_total_classes, embedding_dim)
-#             *****RED****** 'reconstruction': x_hat,  # (n_total_classes, n_sequences, sequence_length, n_markers)
-#         }
-#         {
-#             'y_logits': y_logits, # (n_sequences, sequence_length, n_classes)
-#             'qy_x_probs': qy_x_probs,  # (n_sequences, sequence_length, n_classes)
-#             'qy_e_probs': qy_e_probs, # (n_sequences, sequence_length, n_classes)
-#             'qy_x_logits': qy_x_logits,  # (n_sequences, sequence_length, n_classes)
-    #             *****RED****** 'qz_xy_mean': `,  # (n_classes, n_sequences, sequence_length, embedding_dim)
-#            *****RED******  'qz_xy_logvar': qz_xy_logvar,  # (n_classes, n_sequences, sequence_length, embedding_dim)
-#             *****RED****** 'z_xy_sample': z_xy_sample, # (n_classes, n_sequences, sequence_length, embedding_dim)
-#             'idxs_labeled': idxs_labeled,  # (n_sequences, sequence_length)
-#         }
-        
         # this will be an issue when ydim = batch size
         
         
@@ -361,6 +343,7 @@ class RSLDSM(BaseModel):
         idxs_labeled = outputs_dict_rs['idxs_labeled'].squeeze(-1)
 
         # initialize loss to zero
+        #torch.autograd.set_detect_anomaly(True)
         loss = 0
         loss_dict = {}
         qy_e_probs = outputs_dict_rs['qy_e_probs']
@@ -371,7 +354,6 @@ class RSLDSM(BaseModel):
         # ----------------------------------------------
         if lambda_strong > 0:
             loss_strong = self.class_loss(outputs_dict_rs['y_logits'], labels_rs) * lambda_strong
-            
             loss += loss_strong
             # log
             loss_dict['loss_classifier'] = loss_strong.item()
@@ -411,25 +393,56 @@ class RSLDSM(BaseModel):
         # -------------------------------------------------------
         # compute log p(y_t | y_(t-1), z_(t-1)) loss for labeled
         # -------------------------------------------------------
- 
-        # check for labeled data
+        
+        
         if idxs_labeled.sum() > 0:
             
-            py_logits = outputs_dict_rs['py_logits'][:, idxs_labeled > 0, :]
-            y_gt_scalar = labels_rs[labels_rs != ignore_class]
+            py_logits = outputs_dict_rs['py_logits']  # (n_total_classes, N, n_total_classes)
+            y_input = labels_rs
+            y_input[labels_rs == ignore_class] = 1  # shape (N,)
 
-            py_logits_labeled = torch.zeros((py_logits.shape[1], py_logits.shape[2]))
-            for i, k in enumerate(y_gt_scalar):
-                py_logits_labeled[i] = py_logits[k, i, :]
+            logpy = []
+            for k in range(y_dim):
+                py = Categorical(logits=py_logits[k])
 
-            py = Categorical(logits=py_logits_labeled) 
+                # evaluate prob of true labels
+                logpy.append(py.log_prob(y_input))
+                
+            logpy = torch.stack(logpy, dim=0) # (y_dim, N)
+            
+            # marginalize over conditioning var y_{t-1}
+            e_py = self.get_expectation(logpy[:, 1:].transpose(0,1), qy_e_probs[:-1, :], axis=1)
+            
+            if labels_rs[0] != ignore_class:
+                e_py = torch.cat([logpy[labels_rs[0], 0].unsqueeze(0), e_py], dim=0)              
+            else:
+                e_py = torch.cat([torch.zeros(1), e_py], dim=0)
+            
+            # subselect results from labeled data
+            e_py_labeled = e_py[labels_rs != ignore_class]
+            
+            loss_py = torch.mean(e_py_labeled, axis=0) * (-1)
+            #print('loss_py', loss_py)
+            
+        # check for labeled data
+#         if idxs_labeled.sum() > 0:
+            
+#             py_logits = outputs_dict_rs['py_logits'][:, idxs_labeled > 0, :]
+#             y_gt_scalar = labels_rs[labels_rs != ignore_class]
 
-            loss_py = torch.mean(py.log_prob(y_gt_scalar), axis=0) * (-1)
+#             py_logits_labeled = torch.zeros((py_logits.shape[1], py_logits.shape[2]))
+#             for i, k in enumerate(y_gt_scalar):
+#                 py_logits_labeled[i] = py_logits[k, i, :]
+
+#             py = Categorical(logits=py_logits_labeled) 
+
+#             loss_py = torch.mean(py.log_prob(y_gt_scalar), axis=0) * (-1)
 
             loss += loss_py
 
             # log
             loss_dict['loss_py'] = loss_py.item()
+
 
         # ----------------------------------------------------------------------------------
         # compute kl loss between q(y_t|x_(T_t) and p(y_t|y_(t-1), z_(t-1)) for unlabeled
@@ -438,37 +451,54 @@ class RSLDSM(BaseModel):
          # 'py_logits': py_logits, # (n_total_classes, N, n_total_classes)
          #     'y_logits': y_logits, # (N, n_classes)
         
+        
+        
+        
         # check that we have unlabeled observatios
         if idxs_labeled.sum() < idxs_labeled.shape[0]:
-   
+            
             # create classifier q(y_t|x_t) 
-            qy_logits = outputs_dict_rs['qy_x_logits'][idxs_labeled == 0, :]
+            qy_logits = outputs_dict_rs['qy_x_logits'].unsqueeze(0)  # (1, N, n_classes)
             qy = Categorical(logits=qy_logits)
 
             # create prior p(y)
-            py_logits = outputs_dict_rs['py_logits'][:, idxs_labeled == 0, :]
-            py = Categorical(logits=py_logits) 
+            py_logits = outputs_dict_rs['py_logits']  # (n_classes, N, n_classes)
+            py = Categorical(logits=py_logits)
 
             loss_y_kl = torch.transpose(kl_divergence(qy, py), 0, 1)
-            #print('kl y loss', loss_y_kl.shape)
-            #print('e shape', qy_e_probs[idxs_labeled == 0].shape)
-            
+
             # get expectation
-            expectation_probs = torch.vstack((torch.ones(y_dim)/y_dim, qy_e_probs[idxs_labeled == 0][:-1]))
-            
-            #print('expectation_probs', expectation_probs.shape, expectation_probs)
-            
-            loss_y_kl = self.get_expectation(loss_y_kl, qy_e_probs[idxs_labeled == 0])
-            
-            # mean over batch dim
-            loss_y_kl = torch.mean(loss_y_kl, axis=0)
-            
-            loss_y_kl = loss_y_kl * kl_y_weight
+            expectation_probs = torch.vstack((torch.ones(y_dim)/y_dim, qy_e_probs[:-1]))
 
+            # compute expectation across all timepoints, labeled and unlabeled
+            loss_y_kl = self.get_expectation(loss_y_kl, expectation_probs)
+
+            # subselect unlabeled data, mean over batch dim
+            loss_y_kl = torch.mean(loss_y_kl[idxs_labeled == 0], axis=0) * kl_y_weight
+            #loss_y_kl *= kl_y_weight
             loss += loss_y_kl * 10
-
             loss_dict['loss_y_kl'] = loss_y_kl.item()
-            #print('kl y loss', loss_y_kl)
+
+            
+#             # create classifier q(y_t|x_t) 
+#             qy_logits = outputs_dict_rs['qy_x_logits'][idxs_labeled == 0, :]
+#             qy = Categorical(logits=qy_logits)
+
+#             # create prior p(y)
+#             py_logits = outputs_dict_rs['py_logits'][:, idxs_labeled == 0, :]
+#             py = Categorical(logits=py_logits) 
+#             loss_y_kl = torch.transpose(kl_divergence(qy, py), 0, 1)
+         
+#             # get expectation
+#             expectation_probs = torch.vstack((torch.ones(y_dim)/y_dim, qy_e_probs[idxs_labeled == 0][:-1]))
+            
+#             loss_y_kl = self.get_expectation(loss_y_kl, qy_e_probs[idxs_labeled == 0])           
+#             # mean over batch dim
+#             loss_y_kl = torch.mean(loss_y_kl, axis=0)           
+#             loss_y_kl = loss_y_kl * kl_y_weight
+#             loss += loss_y_kl * 10
+#             loss_dict['loss_y_kl'] = loss_y_kl.item()
+#             #print('kl y loss', loss_y_kl)
          
         # ----------------------------------------------------------------------------------
         # compute kl loss between q(y_t|x_(T_t) and p(y_1) for all
@@ -513,55 +543,64 @@ class RSLDSM(BaseModel):
         # compute kl divergence b/t qz_xy and pz_y
         # ----------------------------------------   
         
-#                 {
-            
-#             *****RED****** 'pz_mean': pz_mean,  # (n_total_classes, N, n_total_classes, embedding_dim)
-#             'pz_logvar': pz_logvar,  # (N, n_total_classes, embedding_dim)
-            
-#             'qy_e_probs': qy_e_probs, # (N, n_classes)
+        # build MVN q(z|x,y)
+        qz_mean = outputs_dict_rs['qz_xy_mean']  # qz_mean shape (y_dim, N, n_latents)
+        qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)
+        qz = Normal(qz_mean, qz_std)
 
-#             *****RED****** 'qz_xy_mean': `,  # (n_classes, N, embedding_dim)
-#            *****RED******  'qz_xy_logvar': qz_xy_logvar,  # (n_classes, N, embedding_dim)
-
-#         }
-        
-        
-        # loop over k-1
         loss_z_kl = 0
         for k_prime in range(y_dim):
-            for k in range(y_dim):
+
+            # build MVN p(z|y)
+            # pz_mean shape (y_dim, N, n_latents))
+            pz_mean = torch.transpose(outputs_dict_rs['pz_mean'][k_prime], 1, 0)
+            pz_std = torch.transpose(outputs_dict_rs['pz_logvar'], 1, 0).exp().pow(0.5)
+            pz = Normal(pz_mean, pz_std)
+
+            # compute kl; final shape (N, y_dim)
+            kl_temp = torch.transpose(torch.sum(kl_divergence(qz, pz), axis=2), 1, 0)
+
+            # expectation over y_t
+            loss_z_kl_temp = torch.sum(
+                outputs_dict_rs['qy_e_probs'][1:] * kl_temp[1:], axis=1)
+            # multiply by probability for y_{t-1}
+            loss_z_kl_temp *= outputs_dict_rs['qy_e_probs'][:1, k_prime]
+
+            # mean over batch
+            loss_z_kl += torch.mean(loss_z_kl_temp, axis=0)
         
-                # build MVN p(z|y)
-                pz_mean = outputs_dict_rs['pz_mean'][k_prime, :, k, :]
-                #print('pzm', pz_mean.shape)
-                pz_std = outputs_dict_rs['pz_logvar'].exp().pow(0.5)[:, k, :]
+#         # loop over k-1
+#         loss_z_kl = 0
+#         for k_prime in range(y_dim):
+#             for k in range(y_dim):
+        
+#                 # build MVN p(z|y)
+#                 pz_mean = outputs_dict_rs['pz_mean'][k_prime, :, k, :]
+#                 #print('pzm', pz_mean.shape)
+#                 pz_std = outputs_dict_rs['pz_logvar'].exp().pow(0.5)[:, k, :]
 
-                #print('pm', pz_mean.shape)
-                #print('pstd', pz_std.shape)
-                pz = Normal(pz_mean, pz_std)
+#                 #print('pm', pz_mean.shape)
+#                 #print('pstd', pz_std.shape)
+#                 pz = Normal(pz_mean, pz_std)
 
-                # build MVN q(z|x,y)
-                qz_mean = outputs_dict_rs['qz_xy_mean'][k]
-                qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)[k]
-                qz = Normal(qz_mean, qz_std)
+#                 # build MVN q(z|x,y)
+#                 qz_mean = outputs_dict_rs['qz_xy_mean'][k]
+#                 qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)[k]
+#                 qz = Normal(qz_mean, qz_std)
 
-                #print('qm', qz_mean.shape)
-                #print('qstd', qz_std.shape)
+#                 #print('qm', qz_mean.shape)
+#                 #print('qstd', qz_std.shape)
                 
-                # sum over latent, mean over batch
-                loss_z_kl_temp = torch.sum(kl_divergence(qz, pz), axis=1) 
-                loss_z_kl += torch.mean(loss_z_kl_temp, axis=0) 
-                #print('loss_z_kl', loss_z_kl.shape)
+#                 # sum over latent, mean over batch
+#                 loss_z_kl_temp = torch.sum(kl_divergence(qz, pz), axis=1) 
+#                 loss_z_kl += torch.mean(loss_z_kl_temp, axis=0) 
+#                 #print('loss_z_kl', loss_z_kl.shape)
 
         loss += kl_weight * loss_z_kl
         # log
         loss_dict['kl_weight'] = kl_weight
         loss_dict['loss_z_kl'] = loss_z_kl.item() * kl_weight 
-        #print('KL weight: ', kl_weight)
-       # print('loss KL (w/o weight): ', loss_kl)
-            
-
-        #print('TOTAL LOSS: ', loss)
+       
         if accumulate_grad:
             loss.backward()
 
