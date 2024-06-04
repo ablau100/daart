@@ -20,6 +20,7 @@ class DilatedTCN(BaseModel):
         super().__init__()
         self.hparams = hparams
         self.model = nn.Sequential()
+        self.dils = [1,2,4,8,16,32,64,128,256,512]
         if type == 'encoder':
             in_size_ = hparams['input_size'] if in_size is None else in_size
             hid_size_ = hparams['n_hid_units'] if hid_size is None else hid_size
@@ -127,7 +128,37 @@ class DilatedTCN(BaseModel):
         # x.transpose(1, 2) -> x = B x T x M
         return self.model(x.transpose(1, 2)).transpose(1, 2)
 
+class SingleStageModel(nn.Module):
+    # num_layers = 10, num_f_maps =64, dim=36, num_classes=12, dil = [1,2,4,8,16,32,64,128,256,512]
+    def __init__(self, num_layers=10, num_f_maps=64, dim=36, num_classes=12, dil=[1,2,4,8,16,32,64,128,256,512]):
+        super(SingleStageModel, self).__init__()
+        self.conv_1x1 = nn.Conv1d(dim, num_f_maps, 1)
+        self.layers = nn.ModuleList([copy.deepcopy(DilatedResidualLayer(dil[i], num_f_maps, num_f_maps)) for i in range(num_layers)])
+        self.conv_out = nn.Conv1d(num_f_maps, num_classes, 1)
 
+    def forward(self, x, mask):
+        out = self.conv_1x1(x)
+        for layer in self.layers:
+            out = layer(out, mask)
+        out = self.conv_out(out) * mask[:, 0:1, :]
+        return out
+
+
+class DilatedResidualLayer(nn.Module):
+    def __init__(self, dilation, in_channels, out_channels):
+        super(DilatedResidualLayer, self).__init__()
+        self.conv_dilated = nn.Conv1d(in_channels, out_channels, 3, padding=dilation, dilation=dilation)
+        self.relu = nn.ReLU(inplace=True)
+        self.bn = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x, mask):
+        out = self.conv_dilated(x)
+        out = self.bn(out)
+        out = self.relu(out)
+        out = out + x
+        return out * mask[:, 0:1, :]
+    
+    
 class DilationBlock(nn.Module):
     """Residual Temporal Block module for use with DilatedTCN class."""
 

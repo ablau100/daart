@@ -19,11 +19,13 @@ import numpy as np
 import os
 import pandas as pd
 import pickle
+import random
 import torch
 from torch.utils import data
 from torch.utils.data import SubsetRandomSampler
 from typing import List, Optional, Union
 from typeguard import typechecked
+
 
 
 __all__ = [
@@ -33,6 +35,7 @@ __all__ = [
 
 
 @typechecked
+
 def split_trials(
         n_trials: int,
         rng_seed: int = 0,
@@ -77,6 +80,7 @@ def split_trials(
 
     n_blocks = int(np.floor(n_trials / tr_per_block))
     if n_blocks == 0:
+        print('num trials: ', n_trials)
         raise ValueError(
             'Not enough trials (n=%i) for the train/test/val/gap values %i/%i/%i/%i' %
             (n_trials, train_tr, val_tr, test_tr, gap_tr))
@@ -189,10 +193,11 @@ def compute_sequence_pad(hparams: dict) -> int:
         pad = 4
     elif hparams['backbone'].lower() == 'tgm':
         raise NotImplementedError
-    elif hparam['backbone'].lower() == 'random-forest':
+    elif hparams['backbone'].lower() == 'random-forest':
         pad = 0
     else:
-        raise ValueError('"%s" is not a valid backbone network' % hparams['backbone'])
+        pad = 0
+        #raise ValueError('"%s" is not a valid backbone network' % hparams['backbone'])
 
     return pad
 
@@ -211,7 +216,9 @@ class SingleDataset(data.Dataset):
             as_numpy: bool = False,
             sequence_length: int = 500,
             sequence_pad: int = 0,
-            input_type: str = 'markers'
+            input_type: str = 'markers',
+            num_labels_remove: int = 0,
+            rng_seed: int = 0
     ) -> None:
         """
 
@@ -243,6 +250,8 @@ class SingleDataset(data.Dataset):
 
         # specify data
         self.id = id
+        self.rng_seed = rng_seed
+        self.num_labels_remove = num_labels_remove
 
         # get data paths
         self.signals = signals
@@ -329,6 +338,8 @@ class SingleDataset(data.Dataset):
             'markers' | 'features'
 
         """
+        
+        raw_data = {}
 
         allowed_signals = ['markers', 'labels_strong', 'labels_weak', 'tasks']
 
@@ -410,12 +421,20 @@ class SingleDataset(data.Dataset):
 
             # apply transforms to ALL data
             if self.transforms[signal]:
-                data_curr = self.transforms[signal](data_curr)
-
+                data_curr = self.transforms[signal](data_curr) 
+                
+            # for labeled only data
+            raw_data[signal] = data_curr
             # compute batches of temporally contiguous data points
             data_curr = compute_sequences(data_curr, sequence_length, self.sequence_pad)
-
+            
             self.data[signal] = data_curr
+            
+#         # labels only - edit markers and labels_strong
+#         raw_data['markers'] = raw_data['markers'][raw_data['labels_strong']!=0]
+#         raw_data['labels_strong'] = raw_data['labels_strong'][raw_data['labels_strong']!=0]
+#         self.data['markers'] = compute_sequences(raw_data['markers'], sequence_length, self.sequence_pad)
+#         self.data['labels_strong'] = compute_sequences(raw_data['labels_strong'], sequence_length, self.sequence_pad)
 
 
 class DataGenerator(object):
@@ -444,7 +463,8 @@ class DataGenerator(object):
             num_workers: int = 0,
             pin_memory: bool = False,
             sequence_pad: int = 0,
-            input_type: str = 'markers'
+            input_type: str = 'markers',
+            num_labels_remove: int = 0
     ) -> None:
         """
 
@@ -491,6 +511,8 @@ class DataGenerator(object):
         self.batch_size = batch_size
         self.as_numpy = as_numpy
         self.device = device
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
 
         self.datasets = []
         self.signals = signals_list
@@ -498,10 +520,16 @@ class DataGenerator(object):
         self.paths = paths_list
         for id, signals, transforms, paths in zip(
                 ids_list, signals_list, transforms_list, paths_list):
-            self.datasets.append(SingleDataset(
+            dataset = SingleDataset(
                 id=id, signals=signals, transforms=transforms, paths=paths, device=device,
                 as_numpy=self.as_numpy, sequence_length=sequence_length,
-                sequence_pad=sequence_pad, input_type=input_type))
+                sequence_pad=sequence_pad, input_type=input_type, num_labels_remove=num_labels_remove,rng_seed=rng_seed)
+            #self.datasets.append(dataset)
+            if len(dataset) == 0:
+                print('BAD FILE')
+                print(paths)
+            else:
+                self.datasets.append(dataset)
 
         # collect info about datasets
         self.n_datasets = len(self.datasets)
@@ -516,7 +544,11 @@ class DataGenerator(object):
         else:
             pass
         self.batch_ratios = [None] * self.n_datasets
+        num_zero = 0
         for i, dataset in enumerate(self.datasets):
+            #if len(dataset) == 0:
+              #  num_zero+=1
+             #   continue
             dataset.batch_idxs = split_trials(len(dataset), rng_seed=rng_seed, **trial_splits)
             dataset.n_batches = {}
             for dtype in self._dtypes:
@@ -573,7 +605,7 @@ class DataGenerator(object):
             self.dataset_iters[i] = {}
             for dtype in self._dtypes:
                 self.dataset_iters[i][dtype] = iter(self.dataset_loaders[i][dtype])
-
+        print('NZ: ', num_zero)
     @typechecked
     def __str__(self) -> str:
         """Pretty printing of dataset info"""

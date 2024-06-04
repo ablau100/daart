@@ -13,7 +13,8 @@ class RNN(BaseModel):
     def __init__(self, hparams, type='encoder', in_size=None, hid_size=None, out_size=None):
         super().__init__()
         self.hparams = hparams
-        self.backbone = hparams.get('backbone', 'lstm').lower()
+        #self.backbone = hparams.get('backbone', 'lstm').lower()
+        self.backbone =  'lstm'
         self.model = nn.ModuleList()
         if type == 'encoder':
             in_size_ = hparams['input_size'] if in_size is None else in_size
@@ -31,7 +32,7 @@ class RNN(BaseModel):
     def _build_rnn(self, in_size, hid_size, out_size, global_layer_num=0):
 
         # RNN layers
-        if self.backbone == 'lstm':
+        if self.backbone == 'lstm' :
             layer = nn.LSTM(
                 input_size=in_size,
                 hidden_size=hid_size,

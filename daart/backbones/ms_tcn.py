@@ -4,10 +4,12 @@ import numpy as np
 from sklearn.metrics import accuracy_score
 import torch
 from torch import nn
+import copy
+import torch.nn.functional as F
 from daart.models.base import BaseModel, get_activation_func_from_str
 
 # to ignore imports for sphix-autoapidoc
-__all__ = ['DilatedTCN']
+__all__ = ['MultiStageModel']
 
 
 class DilatedTCN(BaseModel):
@@ -128,78 +130,90 @@ class DilatedTCN(BaseModel):
         return self.model(x.transpose(1, 2)).transpose(1, 2)
 
 
-class DilationBlock(nn.Module):
-    """Residual Temporal Block module for use with DilatedTCN class."""
-
-    def __init__(
-            self, input_size, int_size, output_size, kernel_size, stride=1, dilation=2,
-            activation='relu', dropout=0.2, final_activation=None, predictor_block=False):
-
-        super(DilationBlock, self).__init__()
-
-        self.conv0 = nn.utils.weight_norm(nn.Conv1d(
-            in_channels=input_size,
-            out_channels=int_size,
-            stride=stride,
-            dilation=dilation,
-            kernel_size=kernel_size * 2 + 1,  # window around t
-            padding=kernel_size * dilation))  # same output
-
-        self.conv1 = nn.utils.weight_norm(nn.Conv1d(
-            in_channels=int_size,
-            out_channels=output_size,
-            stride=stride,
-            dilation=dilation,
-            kernel_size=kernel_size * 2 + 1,  # window around t
-            padding=kernel_size * dilation))  # same output
-
-        # intermediate activations
-        self.activation = get_activation_func_from_str(activation)
-
-        # final activation
-        if final_activation is None:
-            final_activation = activation
-        self.final_activation = get_activation_func_from_str(final_activation)
-
-        # no Dropout1D in pytorch API, but Dropout2D does what what we want:
-        # takes an input of shape (N, C, L) and drops out entire features in the `C` dimension
-        self.dropout = nn.Dropout2d(dropout)
-
-        # build net
-        self.block = nn.Sequential()
-        # conv -> relu -> dropout block # 0
-        self.block.add_module('conv1d_layer_0', self.conv0)
-        self.block.add_module('%s_0' % activation, self.activation)
-        self.block.add_module('dropout_0', self.dropout)
-        # conv -> relu -> dropout block # 1
-        self.block.add_module('conv1d_layer_1', self.conv1)
-        if not predictor_block:
-            self.block.add_module('%s_1' % activation, self.activation)
-            self.block.add_module('dropout_1', self.dropout)
-
-        # for downsampling residual connection
-        if input_size != output_size:
-            self.downsample = nn.Conv1d(input_size, output_size, kernel_size=1)
+class MultiStageModel(nn.Module):
+    def __init__(self, hparams, type='encoder', in_size=None, hid_size=None, out_size=None):
+        #num_stages, num_layers, num_f_maps, dim, num_classes):
+        super(MultiStageModel, self).__init__()
+        num_stages = 4
+        num_layers = 10
+        num_f_maps = 64
+        
+        if type == 'encoder':
+            dim = hparams['input_size'] if in_size is None else in_size
+            num_classes = hparams['n_hid_units']
         else:
-            self.downsample = None
+            dim = hparams['n_hid_units'] if in_size is None else in_size
+            num_classes = hparams['input_size']
 
-        self.init_weights()
+        #dim = dd
+        #num_classes
+        
+        self.stage1 = SingleStageModel(num_layers, num_f_maps, dim, num_classes)
+        self.stages = nn.ModuleList([copy.deepcopy(SingleStageModel(num_layers, num_f_maps, num_classes, num_classes)) for s in range(num_stages-1)])
 
-    def __str__(self):
-        format_str = 'DilationBlock\n'
-        for i, module in enumerate(self.block):
-            format_str += '        {}: {}\n'.format(i, module)
-        format_str += '        {}: residual connection\n'.format(i + 1)
-        format_str += '        {}: {}\n'.format(i + 2, self.final_activation)
-        return format_str
-
-    def init_weights(self):
-        self.conv0.weight.data.normal_(0, 0.01)
-        self.conv1.weight.data.normal_(0, 0.01)
-        if self.downsample is not None:
-            self.downsample.weight.data.normal_(0, 0.01)
-
+#     def forward(self, x, mask):
+#         out = self.stage1(x, mask)
+#         outputs = out.unsqueeze(0)
+#         for s in self.stages:
+#             out = s(F.softmax(out, dim=1) * mask[:, 0:1, :], mask)
+#             outputs = torch.cat((outputs, out.unsqueeze(0)), dim=0)
+#         return outputs
+    
     def forward(self, x):
-        out = self.block(x)
-        res = x if self.downsample is None else self.downsample(x)
-        return self.final_activation(out + res)
+        if x.shape[1] == 2048:
+            x = torch.transpose(x, 1, 2)
+        out = self.stage1(x)
+        outputs = out.unsqueeze(0)
+        for s in self.stages:
+            out = s(F.softmax(out, dim=1))
+            outputs = torch.cat((outputs, out.unsqueeze(0)), dim=0)
+        return outputs
+
+
+class SingleStageModel(nn.Module):
+    def __init__(self, num_layers, num_f_maps, dim, num_classes):
+        super(SingleStageModel, self).__init__()
+        self.conv_1x1 = nn.Conv1d(dim, num_f_maps, 1)
+        self.layers = nn.ModuleList([copy.deepcopy(DilatedResidualLayer(2 ** i, num_f_maps, num_f_maps)) for i in range(num_layers)])
+        self.conv_out = nn.Conv1d(num_f_maps, num_classes, 1)
+
+#     def forward(self, x, mask):
+#         out = self.conv_1x1(x)
+#         for layer in self.layers:
+#             out = layer(out, mask)
+#         out = self.conv_out(out) * mask[:, 0:1, :]
+#         return out
+    
+    def forward(self, x):
+        #print(f"pre shape {x.shape}")
+        if x.shape[1] == 2048:
+            x = torch.transpose(x, 1, 2)#x.transpose(1,2)
+        #print(f"post shape {x.shape}")
+        out = self.conv_1x1(x)
+        for layer in self.layers:
+            out = layer(out)
+        out = self.conv_out(out)
+        return out
+
+
+class DilatedResidualLayer(nn.Module):
+    def __init__(self, dilation, in_channels, out_channels):
+        super(DilatedResidualLayer, self).__init__()
+        self.conv_dilated = nn.Conv1d(in_channels, out_channels, 3, padding=dilation, dilation=dilation)
+        self.conv_1x1 = nn.Conv1d(out_channels, out_channels, 1)
+        self.dropout = nn.Dropout()
+
+#     def forward(self, x, mask):
+#         out = F.relu(self.conv_dilated(x))
+#         out = self.conv_1x1(out)
+#         out = self.dropout(out)
+#         return (x + out) * mask[:, 0:1, :]
+    
+    def forward(self, x):
+        if x.shape[1] == 2048:
+            x = torch.transpose(x, 1, 2)
+        out = F.relu(self.conv_dilated(x))
+        out = self.conv_1x1(out)
+        out = self.dropout(out)
+        return (x + out)
+

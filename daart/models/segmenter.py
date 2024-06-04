@@ -9,8 +9,10 @@ from scipy.stats import entropy
 import torch
 from sklearn.metrics import accuracy_score, r2_score
 from torch import nn, save
-
+from torch.distributions import Categorical
+from torch.distributions.kl import kl_divergence
 from daart import losses
+from daart.losses import FocalLoss
 from daart.models.base import BaseModel, reparameterize_gaussian, get_activation_func_from_str
 
 # to ignore imports for sphix-autoapidoc
@@ -73,11 +75,18 @@ class Segmenter(BaseModel):
             raise NotImplementedError
         else:
             raise NotImplementedError("classifier type must be 'multiclass' or 'binary'")
-        weight = hparams.get('class_weights', None)
+        #weight = hparams.get('class_weights', None)
+        weight = hparams.get('alpha', None)
         if weight is not None:
             weight = torch.tensor(weight)
-        self.class_loss = nn.CrossEntropyLoss(
-            weight=weight, ignore_index=ignore_index, reduction='mean')
+        
+        focal_loss = self.hparams.get('focal_loss', False)
+        if focal_loss:
+            #self.class_loss = FocalLoss(gamma=2, alpha=self.hparams['alpha'], ignore_index=ignore_index)
+            self.class_loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='mean', label_smoothing=.3)
+        else:
+            self.class_loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index, reduction='mean')
+                                                  #, label_smoothing=0.1)
         self.pred_loss = nn.MSELoss(reduction='mean')
         self.task_loss = nn.MSELoss(reduction='mean')
 
@@ -128,7 +137,7 @@ class Segmenter(BaseModel):
             for i, module in enumerate(self.model['task_predictor']):
                 format_str += str('    {}: {}\n'.format(i, module))
 
-        return format_str
+        return ''#format_str
 
     def build_model(self):
         """Construct the model using hparams."""
@@ -145,6 +154,10 @@ class Segmenter(BaseModel):
             raise NotImplementedError('deprecated; use dtcn instead')
         elif self.hparams['backbone'].lower() == 'dtcn':
             from daart.backbones.tcn import DilatedTCN as Module
+        elif self.hparams['backbone'].lower() == 'ms_dtcn':
+            from daart.backbones.ms_tcn import DilatedTCN as Module
+        elif self.hparams['backbone'].lower() == 'msm':
+            from daart.backbones.ms_tcn import MultiStageModel as Module
         elif self.hparams['backbone'].lower() in ['lstm', 'gru']:
             from daart.backbones.rnn import RNN as Module
         elif self.hparams['backbone'].lower() == 'tgm':
@@ -166,19 +179,29 @@ class Segmenter(BaseModel):
                 global_layer_num=len(self.model['encoder'].model), name='latent_logvar',
                 in_size=self.hparams['n_hid_units'], out_size=self.hparams['n_hid_units'])
 
-        # build decoder module
-        if self.hparams.get('lambda_recon', 0) > 0:
-            self.model['decoder'] = Module(self.hparams, type='decoder')
-
-        # build predictor module
-        if self.hparams.get('lambda_pred', 0) > 0:
-            self.model['predictor'] = Module(self.hparams, type='decoder')
-
         # classifier: single linear layer for hand labels
         if self.hparams.get('lambda_strong', 0) > 0:
             self.model['classifier'] = self._build_linear(
                 global_layer_num=global_layer_num, name='classification',
                 in_size=self.hparams['n_hid_units'], out_size=self.hparams['output_size'])
+            
+            format_str = 'seed: ' + str(self.hparams['rng_seed_model']) + '\n'
+
+            for i, module in enumerate(self.model['classifier']):
+                format_str += str('    {}: {}\n'.format(i, module))
+                format_str += str(' Weights py: {}\n'.format(module.weight))
+                format_str += str(' bias py: {}\n'.format(module.bias))
+            format_str += '\n'
+            
+
+        # build predictor module
+        if self.hparams.get('lambda_pred', 0) > 0:
+            self.model['predictor'] = Module(self.hparams, type='decoder')
+        
+            
+       # build decoder module
+        if self.hparams.get('lambda_recon', 0) > 0:
+            self.model['decoder'] = Module(self.hparams, type='decoder')
 
         # classifier: single linear layer for heuristic labels
         if self.hparams.get('lambda_weak', 0) > 0:
@@ -315,7 +338,9 @@ class Segmenter(BaseModel):
         softmax = nn.Softmax(dim=1)
 
         # initialize containers
-
+        
+        # markers
+        markers = [[] for _ in range(data_generator.n_datasets)]
         # softmax outputs
         labels = [[] for _ in range(data_generator.n_datasets)]
         # logits
@@ -328,6 +353,7 @@ class Segmenter(BaseModel):
             labels[sess] = [np.array([]) for _ in range(dataset.n_sequences)]
             scores[sess] = [np.array([]) for _ in range(dataset.n_sequences)]
             embedding[sess] = [np.array([]) for _ in range(dataset.n_sequences)]
+            markers[sess] = [np.array([]) for _ in range(dataset.n_sequences)]
             task_predictions[sess] = [np.array([]) for _ in range(dataset.n_sequences)]
 
         # partially fill container (gap trials will be included as nans)
@@ -349,6 +375,8 @@ class Segmenter(BaseModel):
                         softmax(outputs_dict['labels'][s]).cpu().detach().numpy()
                     embedding[sess][batch_idx] = \
                         outputs_dict['embedding'][s].cpu().detach().numpy()
+                    markers[sess][batch_idx] = \
+                        data['markers'][:, pad:-pad][s].cpu().detach().numpy()
                     if return_scores:
                         scores[sess][batch_idx] = \
                             outputs_dict['labels'][s].cpu().detach().numpy()
@@ -361,6 +389,7 @@ class Segmenter(BaseModel):
             'scores': scores,
             'embedding': embedding,
             'task_predictions': task_predictions,
+            'markers': markers
         }
 
     def training_step(self, data, accumulate_grad=True, **kwargs):
@@ -398,6 +427,8 @@ class Segmenter(BaseModel):
         # push data through model
         markers_wpad = data['markers']
         outputs_dict = self.forward(markers_wpad)
+        
+        #np.random.seed(0)
 
         # remove padding from supplied data
         if lambda_strong > 0:
@@ -516,6 +547,28 @@ class Segmenter(BaseModel):
             # log
             loss_dict['kl_weight'] = kl_weight
             loss_dict['loss_kl'] = loss_kl.item()
+            
+            
+        # ----------------------------------------------------------------------------------
+        # compute kl loss between q(y_t|x_(T_t) and p(y_1) for all (uniform kl)
+        # ----------------------------------------------------------------------------------   
+        if self.hparams['kl_y_weight_uniform'] > 0:
+            y_dim = self.hparams['output_size']
+            py_logits =  torch.cat((torch.tensor([.001]), torch.ones((y_dim-1))/(y_dim-1))).to(device=labels_strong_reshape.device)
+
+            #print('py', py_logits.shape,py_logits)
+            py = Categorical(py_logits) 
+
+            qy_logits = labels_strong_reshape.mean(dim=0) # (N, n_classes)
+
+            qy = Categorical(logits=qy_logits)
+
+            loss_y_kl_uniform = torch.mean(kl_divergence(qy, py), axis=0) 
+            loss_y_kl_uniform = loss_y_kl_uniform * self.hparams['kl_y_weight_uniform']
+            #print("self.hparams['kl_y_weight_uniform']", self.hparams['kl_y_weight_uniform'])
+
+            loss += loss_y_kl_uniform
+            loss_dict['loss_y_kl_uniform'] = loss_y_kl_uniform.item()
 
         if accumulate_grad:
             loss.backward()

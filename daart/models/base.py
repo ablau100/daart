@@ -424,7 +424,7 @@ class BaseInference(BaseModel):
     def forward(self, x, y):
         # push inputs through classifier to get q(y|x)
         y_logits = self.model['qy_x'](x)
-        #print('qy logits', torch.argmax(y_logits, axis=2))
+        #print('qy logits', y_logits.shape)
         # initialize and sample q(y|x) (should be a one-hot vector)
         qy_x_probs = nn.Softmax(dim=2)(y_logits)
         qy_x_logits = y_logits

@@ -12,6 +12,7 @@ from typeguard import typechecked
 
 from daart.io import export_hparams
 from daart.io import make_dir_if_not_exists
+from daart.eval import get_all_diagnostics, get_f1
 
 # to ignore imports for sphix-autoapidoc
 __all__ = ['Logger', 'Trainer']
@@ -342,9 +343,19 @@ class Trainer(object):
         torch.manual_seed(self.rng_seed_train)
         np.random.seed(self.rng_seed_train)
 
+        
+        # set up f1 dict
+        label_names = model.hparams['label_names']
+        f1_dict = {}
+        for label in label_names:
+            f1_dict[label] = []
+        f1_dict['mean'] = []
+        
         # -----------------------------------
         # train loop
         # -----------------------------------
+        
+        #np.random.seed(1)
         for i_epoch in tqdm(range(self.max_epochs + 1)):
             # Note: the 0th epoch has no training (randomly initialized model is evaluated) so we
             # cycle through `max_epochs` training epochs
@@ -377,6 +388,7 @@ class Trainer(object):
                 data, datasets = data_generator.next_batch('train')
 
                 # call the appropriate loss function
+                #print('data batch', data)
                 loss_dict = model.training_step(data, accumulate_grad=True)
                 logger.update_metrics('train', loss_dict, dataset=datasets)
 
@@ -388,42 +400,48 @@ class Trainer(object):
                 # --------------------------------------
                 # check validation according to schedule
                 # --------------------------------------
-                if np.any(self.curr_batch == self.val_check_batch):
+#                 if np.any(self.curr_batch == self.val_check_batch):
 
-                    logger.reset_metrics('val')
-                    data_generator.reset_iterators('val')
-                    model.eval()
+#                     logger.reset_metrics('val')
+#                     data_generator.reset_iterators('val')
+#                     model.eval()
 
-                    for i_val in range(data_generator.n_tot_batches['val']):
-                        # get next minibatch and put it on the device
-                        data, datasets = data_generator.next_batch('val')
+#                     for i_val in range(data_generator.n_tot_batches['val']):
+#                         # get next minibatch and put it on the device
+#                         data, datasets = data_generator.next_batch('val')
 
-                        # call the appropriate loss function
-                        loss_dict = model.training_step(data, accumulate_grad=False)
-                        logger.update_metrics('val', loss_dict, dataset=datasets)
+#                         # call the appropriate loss function
+#                         loss_dict = model.training_step(data, accumulate_grad=False)
+#                         logger.update_metrics('val', loss_dict, dataset=datasets)
 
-                    # save best val model
-                    if logger.get_loss('val') < best_val_loss:
-                        best_val_loss = logger.get_loss('val')
-                        model.save(os.path.join(save_path, 'best_val_model.pt'))
-                        best_model_saved = True
-                        best_val_epoch = i_epoch
+# #                     # save best val model
+# #                     if logger.get_loss('val') < best_val_loss:
+# #                         best_val_loss = logger.get_loss('val')
+# #                         model.save(os.path.join(save_path, 'best_val_model.pt'))
+# #                         best_model_saved = True
+# #                         best_val_epoch = i_epoch
 
-                    # export aggregated metrics on val data
-                    logger.create_metric_row(
-                        dtype='val', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
-                        by_dataset=False, best_epoch=best_val_epoch)
-                    # export individual dataset metrics on val data if possible
-                    if data_generator.n_datasets > 1:
-                        for dataset in range(data_generator.n_datasets):
-                            logger.create_metric_row(
-                                dtype='val', epoch=i_epoch, batch=i_batch, dataset=dataset,
-                                trial=-1, by_dataset=True, best_epoch=best_val_epoch)
+#                     # export aggregated metrics on val data
+#                     logger.create_metric_row(
+#                         dtype='val', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
+#                         by_dataset=False, best_epoch=best_val_epoch)
+#                     # export individual dataset metrics on val data if possible
+#                     if data_generator.n_datasets > 1:
+#                         for dataset in range(data_generator.n_datasets):
+#                             logger.create_metric_row(
+#                                 dtype='val', epoch=i_epoch, batch=i_batch, dataset=dataset,
+#                                 trial=-1, by_dataset=True, best_epoch=best_val_epoch)
+                            
+#             # ---------------------------------------
+#             # update test f1 scores at end of epoch
+#             # ---------------------------------------
+#             model.eval()
+#             get_f1(model, model.hparams, data_gen_test, f1_dict)
 
             # ---------------------------------------
             # export training metrics at end of epoch
             # ---------------------------------------
-            # export aggregated metrics on train data
+            # export aggregated metrics on train data 
             logger.create_metric_row(
                 dtype='train', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
                 by_dataset=False, best_epoch=best_val_epoch)
@@ -480,13 +498,17 @@ class Trainer(object):
                 by_dataset=True)
             
         # compute metrics on entire train set and held-out test set
-        from daart.eval import get_all_diagnostics
         #get_all_diagnostics(model, model.hparams, data_generator, os.path.join('/home/bsb2144/daart'))
         #get_all_diagnostics(model, model.hparams, data_generator, os.path.join(model.hparams['tt_version_dir'], 'diagnostics_train')) 
         
-        #get_all_diagnostics(model, model.hparams, data_gen_test, os.path.join(model.hparams['tt_version_dir'], 'diagnostics_test'))
+#         get_all_diagnostics(model, model.hparams, data_gen_test, os.path.join(model.hparams['tt_version_dir'], 'diagnostics_test'))
+        
+#         # save f1 scores as csv
+#         f1_df = pd.DataFrame(f1_dict)
+#         f1_df.to_csv(os.path.join(model.hparams['tt_version_dir'], 'f1_scores.csv'), index=False)
 
         # save out hparams
+        model.hparams['py_probs'] = 0
         if save_path is not None:
             from daart.io import export_hparams
             model.hparams['best_val_epoch'] = best_val_epoch

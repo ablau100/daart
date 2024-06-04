@@ -26,6 +26,43 @@ def confusion_matrix(true_states, inf_states, num_states):
             ztotal[i] += np.sum(ztrue==i)
     return confusion / ztotal
 
+
+def get_f1(model, hparams, data_gen, f1_dict):
+    
+    # get F1
+    tmp = model.predict_labels(data_gen, return_scores=True)
+    y_hat = np.vstack(tmp['qy_x_probs'][0])
+    y_gt = np.vstack(tmp['labels_strong'][0]).reshape(-1)
+    label_names = hparams['label_names']
+    
+    f1 = np.zeros(len(label_names)) 
+    f1_groups = list(itertools.permutations(list(range(len(label_names)))))
+    
+    y_hat = np.argmax(y_hat, axis=1)
+    y_hat_best = np.zeros_like(y_hat)
+
+    background = 0 if hparams['ignore_class']==0 else None
+    for perm in f1_groups:
+        y_hat_temp = np.ones_like(y_hat) * -1
+        for i in range(len(label_names)):
+            y_hat_temp[y_hat==i] = perm[i]
+        
+        f1_temp = np.array(get_precision_recall(y_gt, y_hat_temp, background, len(label_names))['f1']).astype(float)
+        
+        if np.mean(f1_temp) > np.mean(f1):
+            f1 = f1_temp
+            y_hat_best = y_hat_temp
+    
+    f1s = list(f1)
+    f1s = f1s+[sum(f1s)/len(f1s)]
+                        
+    # update dict
+    for l, label in enumerate(label_names):
+        f1_dict[label].append(f1s[l])
+               
+    f1_dict['mean'].append(f1s[-1])
+    
+
 def get_all_diagnostics(model, hparams, data_gen, save_path):
     
     if not os.path.exists(save_path):
@@ -306,7 +343,7 @@ def plot_training_curves(
     metrics_list = [
         'loss', 'loss_weak', 'loss_strong', 'loss_pred', 'loss_task', 'loss_kl', 'fc',
         'loss_unlabeled', 'loss_reconstruction', 'loss_classifier', 'loss_entropy', 'loss_y_logprob',
-        'loss_y_kl', 'loss_z_kl', 'loss_y_kl_uniform'
+        'loss_y_kl', 'loss_z_kl', 'loss_y_kl_uniform', 'loss_py'
     ]
 
     metrics_dfs = [load_metrics_csv_as_df(metrics_file, metrics_list, expt_ids=expt_ids)]

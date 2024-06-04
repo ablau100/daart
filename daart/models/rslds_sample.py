@@ -573,6 +573,7 @@ class RSLDSS(BaseModel):
         # compute classification loss on labeled data
         # ----------------------------------------------
         if lambda_strong > 0:
+            print('log', outputs_dict_rs['y_logits'],outputs_dict_rs['y_logits'].shape)
             loss_strong = self.class_loss(outputs_dict_rs['y_logits'], labels_rs) * lambda_strong
             
             loss += loss_strong

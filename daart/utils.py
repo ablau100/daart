@@ -19,6 +19,14 @@ def build_data_generator(hparams: dict, test: bool=False) -> DataGenerator:
     paths = []
     
     expt_ids = hparams['expt_ids_test'] if test else hparams['expt_ids']
+    
+#     for expt_id in expt_ids:
+#         if expt_id not in hparams['expt_ids_to_keep']:
+#             if expt_id in hparams['expt_ids']:
+#                 hparams['expt_ids'].remove(expt_id)
+#     expt_ids = hparams['expt_ids_test'] if test else hparams['expt_ids']       
+    
+    
     #print('hp', hparams['expt_ids'])
     for expt_id in expt_ids:
 
@@ -39,13 +47,15 @@ def build_data_generator(hparams: dict, test: bool=False) -> DataGenerator:
             raise FileNotFoundError(msg)
         signals_curr.append('markers')
         transforms_curr.append(ZScore())
+        #transforms_curr.append(None)
         paths_curr.append(markers_file)
 
         # hand labels
-        #print('dirs', hparams.get('expt_ids_to_keep', hparams['expt_ids']))
+        #print('dirs to keep', hparams.get('expt_ids_to_keep', hparams['expt_ids']))
         #print('test dirs', hparams['expt_ids_test'])
         if hparams.get('lambda_strong', 0) > 0:
-            if expt_id not in (hparams['expt_ids'] + hparams['expt_ids_test']):
+            if expt_id not in hparams['expt_ids_to_keep']:# or hparams.get('labeled_ids', []):#(hparams['expt_ids'] + hparams['expt_ids_test']):
+                #print('USING NONE')
                 hand_labels_file = None
             else:
                 hand_labels_file = os.path.join(
@@ -87,7 +97,9 @@ def build_data_generator(hparams: dict, test: bool=False) -> DataGenerator:
         sequence_length=seq_length, sequence_pad=hparams['sequence_pad'],
         batch_size=hparams['batch_size'],
         trial_splits=hparams['trial_splits'], train_frac=hparams['train_frac'],
-        input_type=hparams.get('input_type', 'markers'))
+        input_type=hparams.get('input_type', 'markers'),
+        num_labels_remove=hparams['num_labels_remove'],
+        rng_seed=hparams['rng_seed_train'])
 
     # automatically compute input/output sizes from data
     input_size = 0
