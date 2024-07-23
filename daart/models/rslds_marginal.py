@@ -483,19 +483,6 @@ class RSLDSM(BaseModel):
         reconstruction = outputs_dict_rs['reconstruction'] # (y_dim, N, n_markers)
         px_z_mean = reconstruction
         px_z_std = torch.ones_like(px_z_mean)* .5
-        
-#         if torch.any(torch.isnan(px_z_mean)):
-#             print('nanapx_z_mean mean')         
-#         if torch.any(torch.isinf(px_z_mean)):
-#             print('inf px_z_meanmean')
-#         if torch.any(torch.isnan(px_z_std)):
-#             print('nanapx_z_std st')   
-#         if torch.any(torch.isinf(px_z_std)):
-#             print('infpx_z_std st')
-            
-#         if 0 in px_z_std:
-#             px_z_std = torch.add(px_z_std, 1e-6)
-
         px_z = Normal(px_z_mean, px_z_std)
         
         # diff between log prob of adding 1d Normals and MVN log prob
@@ -586,14 +573,10 @@ class RSLDSM(BaseModel):
         
 
         # subselect unlabeled data, mean over batch dim
-        betas = torch.tensor([1, .5, .25], device=device)
+        betas = torch.tensor([1, .5, .25], device=device) * 10
         
-        loss_y_kl = torch.mean(loss_y_kl[idxs_labeled == 0], axis=0) * kl_y_weight * ann_weight
-        #loss_y_kl = torch.mean(loss_y_kl[idxs_labeled == 0], axis=0) *betas[0]#* kl_y_weight * ann_weight
-        loss += loss_y_kl
-        loss_dict['loss_y_kl'] = loss_y_kl.item()
-        
-        
+        #loss_y_kl = torch.mean(loss_y_kl[idxs_labeled == 0], axis=0) 
+        loss_y_kl = torch.mean(loss_y_kl[idxs_labeled == 0], axis=0) *betas[0]
         # for D = 3, add 2 extra terms
         pad = self.hparams.get('sequence_pad', 0)
         if 'overshoot_y' in self.hparams:
@@ -603,13 +586,17 @@ class RSLDSM(BaseModel):
             py_logits_new = outputs_dict['qy_e_probs']
             z_sample_new = outputs_dict['z_xy_sample']
 
+            # start with pushing py_logits and z_sample (from q(z|x,y)) into the generative model
             gen_params = {'y_probs': py_logits_new, 'z_sample': z_sample_new, 'idxs_labeled': []}
 
             for d in range(1, D):
+                # start with pushing py_logits and z_sample (from q(z|x,y)) into the generative model
                 gen_new = self.generative(**gen_params)
-
+                
+                # extract the new py and pz values
                 py_logits_new, pz_mean_new, pz_logvar_new = gen_new['py_logits'], gen_new['pz_mean'], gen_new['pz_logvar']
-
+                
+                # reshape the outputs
                 py_logits_new_rs = py_logits_new.reshape((y_dim, N, y_dim))
                 py_logits_new_rs = nn.Softmax(dim=2)(py_logits_new_rs)
 
@@ -632,7 +619,7 @@ class RSLDSM(BaseModel):
                 z_sample_new = z_sample_new.permute(1,0,2)
                 #print(z_sample_new.shape, 'z_sample_new ')
                 loss_y_kl_new = betas[d] * self.get_expectation(kl_matrix[d:, :], py_logits_e[:-d, :])
-                loss_y_kl += torch.mean(loss_y_kl_new, axis=0) * kl_y_weight * ann_weight
+                loss_y_kl += torch.mean(loss_y_kl_new, axis=0) 
                 
                 batch_size = self.hparams['batch_size']
                 seq_len = self.hparams['sequence_length']
@@ -640,7 +627,9 @@ class RSLDSM(BaseModel):
                 gen_params['z_sample'] = torch.reshape(z_sample_new, (y_dim,batch_size,seq_len,z_dim))
                 py_logits_old_rs = py_logits_e
 
-
+        loss += loss_y_kl * kl_y_weight * ann_weight
+        loss_dict['loss_y_kl'] = loss_y_kl.item()
+        
         # ----------------------------------------------------------------------------------
         # compute kl loss between q(y_t|x_(T_t) and p(y_1) for all (uniform kl)
         # ----------------------------------------------------------------------------------
@@ -688,26 +677,7 @@ class RSLDSM(BaseModel):
         
         # build MVN q(z|x,y)
         qz_mean = outputs_dict_rs['qz_xy_mean']  # qz_mean shape (y_dim, N, n_latents)
-        qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)
-        
-#         if torch.any(torch.isnan(qz_mean)):
-#             print('nana mean')
-            
-#         if torch.any(torch.isinf(qz_mean)):
-#             print('inf mean')
-        
-#         if torch.any(torch.isnan(qz_std)):
-#             print('nana st')
-            
-#         if torch.any(torch.isinf(qz_std)):
-#             print('inf st')
-            
-#         if 0 in qz_std:
-#             qz_std = torch.add(qz_std, 1e-6)
-#             #qz_mean = torch.add(qz_mean, 1e-6)
-            
-        #print('qz_mean', qz_mean.shape)
-        #print('qz_std',qz_std.shape)   
+        qz_std = outputs_dict_rs['qz_xy_logvar'].exp().pow(0.5)  
         qz = Normal(qz_mean, qz_std)
         
         # first dim is y_(t-1) 3rd dim is y_t

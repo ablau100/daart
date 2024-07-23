@@ -98,7 +98,6 @@ def build_data_generator(hparams: dict, test: bool=False) -> DataGenerator:
         batch_size=hparams['batch_size'],
         trial_splits=hparams['trial_splits'], train_frac=hparams['train_frac'],
         input_type=hparams.get('input_type', 'markers'),
-        num_labels_remove=hparams['num_labels_remove'],
         rng_seed=hparams['rng_seed_train'])
 
     # automatically compute input/output sizes from data

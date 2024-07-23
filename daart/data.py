@@ -385,7 +385,7 @@ class SingleDataset(data.Dataset):
                 self.dtypes[signal] = 'float32'
 
             elif signal == 'labels_strong':
-
+                # comment to rmove all labels
                 if (self.paths[signal] is None) or not os.path.exists(self.paths[signal]):
                     # if no path given, assume same size as markers and set all to background
                     if 'markers' in self.data.keys():
