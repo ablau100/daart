@@ -358,6 +358,7 @@ def plot_training_curves(
     sns.set_context('talk')
     data_queried = metrics_df[
         (metrics_df.epoch > 10) & ~pd.isna(metrics_df.val) & (metrics_df.dtype == dtype)]
+    print(data_queried, data_queried.shape)
     g = sns.FacetGrid(
         data_queried, col='loss', col_wrap=2, hue=hue, sharey=False, height=4)
     g = g.map(plt.plot, 'epoch', 'val').add_legend()

@@ -103,13 +103,13 @@ class Logger(object):
         metrics = {**loss_dict, 'batches': 1}  # append `batches` to loss_dict
 
         for key, val in metrics.items():
-
             # define metric for the first time if necessary
             if key not in self.metrics[dtype]:
                 self.metrics[dtype][key] = 0
 
             # update aggregate methods
-            self.metrics[dtype][key] += val
+            if not np.isnan(val):
+                self.metrics[dtype][key] += val
 
             # update separated metrics if dataset exists and is integer or list of length 1
             if dataset is not None and self.n_datasets > 1:
@@ -185,6 +185,7 @@ class Logger(object):
                 if key == 'batches':
                     continue
                 metric_row['%s_%s' % (prefix, key)] = val / norm
+
         else:
             dataset = -1
             norm = self.metrics[dtype]['batches']

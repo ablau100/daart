@@ -430,11 +430,80 @@ class SingleDataset(data.Dataset):
             
             self.data[signal] = data_curr
             
-#         # labels only - edit markers and labels_strong
-#         raw_data['markers'] = raw_data['markers'][raw_data['labels_strong']!=0]
-#         raw_data['labels_strong'] = raw_data['labels_strong'][raw_data['labels_strong']!=0]
-#         self.data['markers'] = compute_sequences(raw_data['markers'], sequence_length, self.sequence_pad)
-#         self.data['labels_strong'] = compute_sequences(raw_data['labels_strong'], sequence_length, self.sequence_pad)
+
+    def load_full_data(self, input_type):
+        """Load all data into memory.
+
+        Parameters
+        ----------
+        sequence_length : int
+            number of contiguous data points in a sequence
+        input_type : str
+            'markers' | 'features'
+
+        """
+        
+        raw_data = {}
+
+        allowed_signals = ['markers', 'labels_strong', 'labels_weak', 'tasks']
+
+        for signal in self.signals:
+
+            if signal == 'markers':
+
+                file_ext = self.paths[signal].split('.')[-1]
+
+                if file_ext == 'csv':
+                    if input_type == 'markers':
+                        xs, ys, ls, marker_names = load_marker_csv(self.paths[signal])
+                        data_curr = np.hstack([xs, ys])
+                    else:
+                        vals, feature_names = load_feature_csv(self.paths[signal])
+                        data_curr = vals
+
+                elif file_ext == 'h5':
+                    if input_type != 'markers':
+                        raise NotImplementedError
+                    xs, ys, ls, marker_names = load_marker_h5(self.paths[signal])
+                    data_curr = np.hstack([xs, ys])
+
+                elif file_ext == 'npy':
+                    # assume single array
+                    data_curr = np.load(self.paths[signal])
+
+                else:
+                    raise ValueError('"%s" is an invalid file extension' % file_ext)
+
+                self.dtypes[signal] = 'float32'
+
+
+            elif signal == 'labels_strong':
+                # comment to rmove all labels
+                if (self.paths[signal] is None) or not os.path.exists(self.paths[signal]):
+                    # if no path given, assume same size as markers and set all to background
+                    if 'markers' in self.data.keys():
+                        data_curr = np.zeros(
+                            (len(self.data['markers']) * sequence_length,), dtype=np.int)
+                    else:
+                        raise FileNotFoundError(
+                            'Could not load "labels_strong" from None file without markers')
+                else:
+                    labels, label_names = load_label_csv(self.paths[signal])
+                    data_curr = np.argmax(labels, axis=1)
+
+                self.dtypes[signal] = 'int32'
+
+
+            else:
+                raise ValueError(
+                    '"{}" is an invalid signal type; must choose from {}'.format(
+                        signal, allowed_signals))
+
+            # apply transforms to ALL data
+            if self.transforms[signal]:
+                data_curr = self.transforms[signal](data_curr) 
+                
+            return data_curr
 
 
 class DataGenerator(object):
