@@ -340,7 +340,6 @@ class Trainer(object):
         # -----------------------------------
         # train loop
         # -----------------------------------
-
         
         # start time
         start_time = time.time()
