@@ -340,14 +340,11 @@ class Trainer(object):
         # -----------------------------------
         # train loop
         # -----------------------------------
-<<<<<<< Updated upstream
-=======
+
         
         # start time
         start_time = time.time()
 
-        
->>>>>>> Stashed changes
         for i_epoch in tqdm(range(self.max_epochs + 1)):
             # Note: the 0th epoch has no training (randomly initialized model is evaluated) so we
             # cycle through `max_epochs` training epochs
