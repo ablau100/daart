@@ -6,7 +6,7 @@ from scipy.stats import entropy
 import torch
 from sklearn.metrics import accuracy_score, r2_score
 from torch import nn, save
-
+from daart.models.pooling import PMA
 from daart import losses
 
 # to ignore imports for sphix-autoapidoc
@@ -181,6 +181,19 @@ class Segmenter(BaseModel):
         # - decoder: latents[t] -> inputs[t]
         # - predictor: latents[t] -> inputs[t+1]
         self.model = nn.ModuleDict()
+        
+        
+        # if using transformer_pool, build a PMA first
+        if hparams.get('use_pool', False):
+            # patch_dim must come from your data_generator / hparams
+            D   = hparams['patch_dim']         # e.g. 768
+            H   = hparams['pool']['num_heads'] # e.g. 8
+            S   = hparams['pool']['num_seeds'] # e.g. 1
+            self.model['pool'] = PMA(dim=D, num_heads=H, num_seeds=S, ln=True)
+            # override input_size for subsequent TCN
+            hparams['input_size'] = D * S
+        
+        
         self.build_model()
 
         # label loss based on cross entropy; don't compute gradient when target = 0
@@ -349,6 +362,18 @@ class Segmenter(BaseModel):
 
         """
         # push data through encoder to get latent embedding
+        
+        if self.hparams.get('use_pool', False):
+            B, T, PD = x.shape
+            D = self.hparams['patch_dim']
+            P = PD // D
+            # reshape → (B*T, P, D)
+            x_ = x.view(B*T, P, D)
+            # apply pooling → (B*T, S, D)
+            pooled = self.model['pool'](x_)
+            # reshape → (B, T, S*D)
+            x = pooled.view(B, T, -1)
+        
         # x = B x T x N (e.g. B = 2, T = 500, N = 16)
         x = self.model['encoder'](x)
         if self.hparams.get('variational', False):

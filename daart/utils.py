@@ -24,18 +24,18 @@ def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
         
     # ───────────── Transformer branch ─────────────
     # Insert this *before* the stock generator logic:
+    signals    = []
+    transforms = []
+    paths      = []
+
     if hparams.get('input_type') == 'transformer':
-       
         for expt_id in expt_ids:
             signals_curr    = []
             transforms_curr = []
             paths_curr      = []
 
-            # ── 1) features (video) or markers ────────────────────────────────
-            input_type = hparams.get('input_type', 'markers')
+            # ── 1) features (video) ────────────────────────────────────────
             base_dir   = hparams['video_dir']
-
-            # look for video files
             possible_vids = [
                 os.path.join(base_dir, f"{expt_id}{ext}")
                 for ext in (".mp4", ".avi", ".mov")
@@ -46,11 +46,9 @@ def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
 
             signals_curr.append('markers')
             transforms_curr.append(None)
-            #transforms_curr.append(ZScore())
             paths_curr.append(video_file)
-            
 
-            # ── 2) hand labels ─────────────────────────────────────────────────
+            # ── 2) hand labels ─────────────────────────────────────────────
             if hparams.get('lambda_strong', 0) > 0:
                 lbl_dir = os.path.join(hparams['data_dir'], 'labels-hand')
                 possible_lbls = [
@@ -65,38 +63,31 @@ def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
                 transforms_curr.append(None)
                 paths_curr.append(hand_file)
 
-        # collect this session
-        signals.append(signals_curr)
-        transforms.append(transforms_curr)
-        paths.append(paths_curr)
+            # ── 3) collect this session ────────────────────────────────────
+            signals.append(signals_curr)
+            transforms.append(transforms_curr)
+            paths.append(paths_curr)
 
-        # compute any needed pad
-        hparams['sequence_pad'] = 0#compute_sequence_pad(hparams)
-
-        # build the DataGenerator with our StreamingSingleDataset
+        # ── after loop, build your DataGenerator ────────────────────────
+        hparams['sequence_pad'] = 0  # or compute_sequence_pad(hparams)
         data_gen = DataGenerator(
-            ids_list        = hparams['expt_ids'],
-            signals_list    = signals,
-            transforms_list = transforms,
-            paths_list      = paths,
-            device          = hparams['device'],
-            sequence_length = hparams['sequence_length'],
-            sequence_pad    = hparams['sequence_pad'],
-            batch_size      = hparams['batch_size'],
-            trial_splits    = hparams['trial_splits'],
-            train_frac      = hparams['train_frac'],
-            input_type      = input_type,
-            dataset_class   = StreamingSingleDataset,
+            ids_list           = hparams['expt_ids'],
+            signals_list       = signals,
+            transforms_list    = transforms,
+            paths_list         = paths,
+            device             = hparams['device'],
+            sequence_length    = hparams['sequence_length'],
+            sequence_pad       = hparams['sequence_pad'],
+            batch_size         = hparams['batch_size'],
+            trial_splits       = hparams['trial_splits'],
+            train_frac         = hparams['train_frac'],
+            input_type         = 'transformer',
+            dataset_class      = StreamingSingleDataset,
             transformer_config = hparams['transformer_config'],
-            transformer_ckpt = hparams['transformer_ckpt']
+            transformer_ckpt   = hparams['transformer_ckpt']
         )
 
-        # infer and store input/output dims exactly as before
-        #hparams['input_size']  = data_gen.input_size
         hparams['output_size'] = len(data_gen.label_names)
-
-        # (keep your lambda_task logic here if needed)
-
         return data_gen
     
     # old code for other feature types
