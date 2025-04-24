@@ -47,7 +47,7 @@ class EarlyStopping(BaseCallback):
     def on_epoch_end(self, data_generator, model, trainer, logger=None, **kwargs):
 
         # skip if this is not a validation epoch
-        if ~np.any(trainer.curr_batch == trainer.val_check_batch):
+        if not np.any(trainer.curr_batch == trainer.val_check_batch):
             return
 
         # use overall validation loss for early stopping

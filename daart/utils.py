@@ -5,6 +5,7 @@ import os
 
 from daart.data import compute_sequence_pad, DataGenerator
 from daart.transforms import ZScore
+from daart.data_streaming import StreamingSingleDataset
 
 
 # to ignore imports for sphix-autoapidoc
@@ -13,7 +14,92 @@ __all__ = ['build_data_generator', 'collect_callbacks']
 
 def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
     """Helper function to build a data generator from hparam dict."""
+    signals = []
+    transforms = []
+    paths = []
+    if dtype == 'train':
+        expt_ids = hparams['expt_ids']
+    else:
+        expt_ids = hparams['expt_ids_test']
+        
+    # ───────────── Transformer branch ─────────────
+    # Insert this *before* the stock generator logic:
+    if hparams.get('input_type') == 'transformer':
+       
+        for expt_id in expt_ids:
+            signals_curr    = []
+            transforms_curr = []
+            paths_curr      = []
 
+            # ── 1) features (video) or markers ────────────────────────────────
+            input_type = hparams.get('input_type', 'markers')
+            base_dir   = hparams['video_dir']
+
+            # look for video files
+            possible_vids = [
+                os.path.join(base_dir, f"{expt_id}{ext}")
+                for ext in (".mp4", ".avi", ".mov")
+            ]
+            video_file = next((p for p in possible_vids if os.path.exists(p)), None)
+            if video_file is None:
+                raise FileNotFoundError(f"Video not found for {expt_id} in {base_dir}")
+
+            signals_curr.append('markers')
+            transforms_curr.append(None)
+            #transforms_curr.append(ZScore())
+            paths_curr.append(video_file)
+            
+
+            # ── 2) hand labels ─────────────────────────────────────────────────
+            if hparams.get('lambda_strong', 0) > 0:
+                lbl_dir = os.path.join(hparams['data_dir'], 'labels-hand')
+                possible_lbls = [
+                    os.path.join(lbl_dir, f"{expt_id}_labels.csv"),
+                    os.path.join(lbl_dir, f"{expt_id}.csv"),
+                ]
+                hand_file = next((p for p in possible_lbls if os.path.exists(p)), None)
+                if hand_file is None and hparams.get('train_frac',1.0) == 1.0:
+                    logging.warning(f"No hand-label CSV for {expt_id} in {lbl_dir}")
+
+                signals_curr.append('labels_strong')
+                transforms_curr.append(None)
+                paths_curr.append(hand_file)
+
+        # collect this session
+        signals.append(signals_curr)
+        transforms.append(transforms_curr)
+        paths.append(paths_curr)
+
+        # compute any needed pad
+        hparams['sequence_pad'] = 0#compute_sequence_pad(hparams)
+
+        # build the DataGenerator with our StreamingSingleDataset
+        data_gen = DataGenerator(
+            ids_list        = hparams['expt_ids'],
+            signals_list    = signals,
+            transforms_list = transforms,
+            paths_list      = paths,
+            device          = hparams['device'],
+            sequence_length = hparams['sequence_length'],
+            sequence_pad    = hparams['sequence_pad'],
+            batch_size      = hparams['batch_size'],
+            trial_splits    = hparams['trial_splits'],
+            train_frac      = hparams['train_frac'],
+            input_type      = input_type,
+            dataset_class   = StreamingSingleDataset,
+            transformer_config = hparams['transformer_config'],
+            transformer_ckpt = hparams['transformer_ckpt']
+        )
+
+        # infer and store input/output dims exactly as before
+        #hparams['input_size']  = data_gen.input_size
+        hparams['output_size'] = len(data_gen.label_names)
+
+        # (keep your lambda_task logic here if needed)
+
+        return data_gen
+    
+    # old code for other feature types
     signals = []
     transforms = []
     paths = []
@@ -30,6 +116,7 @@ def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
 
         # DLC markers or features (e.g. from simba)
         input_type = hparams.get('input_type', 'markers')
+        
         base_dir = os.path.join(hparams['data_dir'], input_type)
         possible_markers_files = [
             os.path.join(base_dir, expt_id + '_labeled.h5'),
@@ -166,7 +253,8 @@ def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
         trial_splits=hparams['trial_splits'],
         train_frac=hparams['train_frac'],
         input_type=hparams.get('input_type', 'markers'),
-        batch_transform_params=hparams.get('batch_transform_params', {})
+        batch_transform_params=hparams.get('batch_transform_params', {}),
+        batch_transforms=hparams.get('batch_transforms', [])
     )
 
     # automatically compute input/output sizes from data

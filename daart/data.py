@@ -219,7 +219,12 @@ class SingleDataset(data.Dataset):
             as_numpy: bool = False,
             sequence_length: int = 500,
             sequence_pad: int = 0,
-            input_type: str = 'markers'
+            input_type: str = 'markers',
+            batch_transform_params = {},
+            batch_transforms = [],
+            transformer_config="",
+            transformer_ckpt="",
+            max_imgs_per_pass = 1024
     ) -> None:
         """
 
@@ -258,6 +263,9 @@ class SingleDataset(data.Dataset):
         self.paths = OrderedDict()
         self.dtypes = OrderedDict()
         self.data = OrderedDict()
+        self.transformer_config = transformer_config
+        self.transformer_ckpt = transformer_ckpt
+        self.max_imgs_per_pass = max_imgs_per_pass
         for signal, transform, path in zip(signals, transforms, paths):
             self.transforms[signal] = transform
             self.paths[signal] = path
@@ -279,6 +287,9 @@ class SingleDataset(data.Dataset):
 
         self.device = device
         self.as_numpy = as_numpy
+        
+        self.batch_transform_params = batch_transform_params
+        self.batch_transforms = batch_transforms
 
     @typechecked
     def __str__(self) -> str:
@@ -324,6 +335,66 @@ class SingleDataset(data.Dataset):
                     sample[signal] = torch.from_numpy(sample[signal][0]).float()
                 else:
                     sample[signal] = torch.from_numpy(sample[signal][0]).long()
+            
+            if signal == 'markers':
+                # add data augment transforms
+                #########################
+                #### ADD TRANSFORMS HERE
+                #########################
+        
+                if self.batch_transforms:
+                    # transforms on x,y paw coords for ibl data
+                    # load transform hyper params
+                    params = self.batch_transform_params
+
+                    # do rotation transform
+                    if 'rotate' in self.batch_transforms:
+                        angle = params['angle']
+                        degrees = np.random.uniform(-1 * angle, angle)
+                        #print('angle', angle)
+                        temp = sample[signal] # shape (1, seq_len, input_len)
+                        points = temp[:,:2]
+                        points_rotated = rotate(points, degrees=degrees)
+                        temp[:,:2] = points_rotated
+                        sample[signal] = temp
+
+                    if 'shift' in self.batch_transforms:
+                        u_max = params['shift_max']
+                        u_min = -1 * u_max
+                        temp = sample[signal] # shape (1, seq_len, input_len)
+                        points = temp[:,:2]
+                        points_rotated = shift(points, u_min, u_max)
+                        temp[:,:2] = points_rotated
+                        sample[signal] = temp
+
+                    if 'gaussian_noise' in self.batch_transforms:
+                        sigma = params['sigma']
+                        temp = sample[signal] # shape (1, seq_len, input_len)
+                        points = temp[:,:]
+                        points_rotated = gaussian_noise(points, sigma)
+                        temp[:,:] = points_rotated
+                        sample[signal] = temp
+
+                    if 'shot_noise' in self.batch_transforms:
+                        u_max = params['shot_max']
+                        u_min = -1 * u_max
+                        temp = sample[signal] # shape (1, seq_len, input_len)
+                        points = temp[:,:2]
+                        points_rotated = shot_noise(points, u_min, u_max)
+                        temp[:,:2] = points_rotated
+                        sample[signal] = temp
+                        
+                    # check if we add velocity
+                    if 'velocity' in self.batch_transforms:
+                        velocity = np.vstack([np.zeros_like(sample[signal][0]), np.diff(sample[signal], axis=0)])
+                        velocity = (velocity - self.v_mean) / self.v_std
+                        sample[signal] = torch.tensor(np.hstack([sample[signal], velocity]), dtype=torch.float32)
+                        
+               
+
+                ########################
+                ### END TRANSFORMS
+                ########################
 
         # add batch index
         sample['batch_idx'] = idx
@@ -343,7 +414,7 @@ class SingleDataset(data.Dataset):
 
         """
 
-        allowed_signals = ['markers', 'labels_strong', 'labels_weak', 'tasks']
+        allowed_signals = ['markers','labels_strong','labels_weak','tasks','transformer']
 
         for signal in self.signals:
 
@@ -376,6 +447,7 @@ class SingleDataset(data.Dataset):
                 self.input_size = data_curr.shape[1]
                 self.feature_names = feature_names
                 self.dtypes[signal] = 'float32'
+       
 
             elif signal == 'tasks':
 
@@ -435,6 +507,31 @@ class SingleDataset(data.Dataset):
                 self.label_names = self.label_names or label_names
                 self.dtypes[signal] = 'int32'
 
+            elif signal == 'transformer':
+
+                # pull in the two paths we stashed on the SingleDataset
+                cfg  = self.transformer_config
+                ckpt = self.transformer_ckpt
+
+                # path is the video file
+                video_file = self.paths['transformer']
+
+                # extract in-memory tokens
+                from daart.transformer_loader import extract_patch_tokens
+                feats = extract_patch_tokens(
+                    video_file,
+                    cfg, ckpt,
+                    sequence_length,
+                    device='cuda',
+                    batch_size=2
+                )  # feats: np.ndarray (T, C)
+                print('feats', feats.shape)
+                data_curr = feats
+                # tell daart how many channels we have
+                self.input_size   = data_curr.shape[1]
+                self.feature_names = [f"tok{i}" for i in range(self.input_size)]
+                self.dtypes[signal] = 'float32'
+            
             else:
                 raise ValueError(
                     f'"{signal}" is an invalid signal type; must choose from {allowed_signals}')
@@ -442,6 +539,13 @@ class SingleDataset(data.Dataset):
             # apply transforms to ALL data
             if self.transforms[signal]:
                 data_curr = self.transforms[signal](data_curr)
+                
+            # comput vel for markers and save mean/sd
+            if signal == 'markers':
+                #print('data_curr', data_curr.shape, data_curr[5:])
+                velocity = np.vstack([np.array(np.zeros_like(data_curr[0])), np.diff(data_curr, axis=0)])
+                self.v_mean = np.mean(velocity, axis=0)
+                self.v_std = np.std(velocity, axis=0)
 
             # check data length
             data_len_curr = data_curr.shape[0]
@@ -487,7 +591,11 @@ class DataGenerator(object):
             pin_memory: bool = False,
             sequence_pad: int = 0,
             input_type: str = 'markers',
-            batch_transform_params = {}
+            batch_transform_params = {},
+            batch_transforms = [],
+            transformer_config="",
+            transformer_ckpt="",
+            dataset_class=SingleDataset,
     ) -> None:
         """
 
@@ -534,17 +642,19 @@ class DataGenerator(object):
         self.batch_size = batch_size
         self.as_numpy = as_numpy
         self.device = device
-        self.batch_transform_params = batch_transform_params
         self.datasets = []
         self.signals = signals_list
         self.transforms = transforms_list
         self.paths = paths_list
         for id, signals, transforms, paths in zip(
                 ids_list, signals_list, transforms_list, paths_list):
-            self.datasets.append(SingleDataset(
+            self.datasets.append(dataset_class(
                 id=id, signals=signals, transforms=transforms, paths=paths, device=device,
                 as_numpy=self.as_numpy, sequence_length=sequence_length,
-                sequence_pad=sequence_pad, input_type=input_type))
+                sequence_pad=sequence_pad, input_type=input_type,
+                batch_transform_params = batch_transform_params, batch_transforms=batch_transforms,
+                transformer_config=transformer_config,transformer_ckpt=transformer_ckpt
+            ))
 
         # collect info about datasets
         self.n_datasets = len(self.datasets)
@@ -705,59 +815,6 @@ class DataGenerator(object):
             # get sequence from this dataset
             try:
                 sequence = next(self.dataset_iters[dataset][dtype])
-                #print('seq', sequence)
-                
-                #########################
-                #### ADD TRANSFORMS HERE
-                #########################
-                if transforms:
-                    # transforms on x,y paw coords for ibl data
-                    # (z scoreing already done)
-                    if dtype == 'train':
-                        # load transform hyper params
-                        params = self.batch_transform_params
-
-                        # do rotation transform
-                        if 'rotate' in transforms:
-                            angle = params['angle']
-                            degrees = np.random.uniform(-1 * angle, angle)
-                            #print('angle', angle)
-                            temp = sequence['markers'] # shape (1, seq_len, input_len)
-                            points = temp[0,:,:2]
-                            points_rotated = rotate(points, degrees=degrees)
-                            temp[0,:,:2] = points_rotated
-                            sequence['markers'] = temp
-
-                        if 'shift' in transforms:
-                            u_max = params['shift_max']
-                            u_min = -1 * u_max
-                            temp = sequence['markers'] # shape (1, seq_len, input_len)
-                            points = temp[0,:,:2]
-                            points_rotated = shift(points, u_min, u_max)
-                            temp[0,:,:2] = points_rotated
-                            sequence['markers'] = temp
-
-                        if 'gaussian_noise' in transforms:
-                            sigma = params['sigma']
-                            temp = sequence['markers'] # shape (1, seq_len, input_len)
-                            points = temp[0,:,:]
-                            points_rotated = gaussian_noise(points, sigma)
-                            temp[0,:,:] = points_rotated
-                            sequence['markers'] = temp
-
-                        if 'shot_noise' in transforms:
-                            u_max = params['shot_max']
-                            u_min = -1 * u_max
-                            temp = sequence['markers'] # shape (1, seq_len, input_len)
-                            points = temp[0,:,:2]
-                            points_rotated = shot_noise(points, u_min, u_max)
-                            temp[0,:,:2] = points_rotated
-                            sequence['markers'] = temp
-
-                ########################
-                ### END TRNASFORMS
-                ########################
-                
                 # add sequence to batch
                 sequences.append(sequence)
                 datasets.append(dataset)
@@ -819,11 +876,8 @@ def gaussian_noise(p, sigma):
 
 def shot_noise(p, u_min, u_max):
     ind = np.random.choice([0,1], p.shape, p=[0.99, .01])
-    #print('ind', ind.shape, ind)
     noise = np.random.uniform(u_min, u_max, p.shape)
-    #print('noise', noise.shape, noise)
     masked_noise = ind * noise
-    #print('masked_noise',masked_noise.shape, masked_noise)
     p += masked_noise
     return p
 
@@ -898,7 +952,8 @@ def load_feature_csv(filepath: str) -> tuple:
         - marker names (list): name for each column of `x` and `y` matrices
 
     """
-    df = pd.read_csv(filepath).head(100000)
+    print(f"Reading file: {filepath}")
+    df = pd.read_csv(filepath)
     # drop first column if it just contains frame indices
     unnamed_col = 'Unnamed: 0'
     if unnamed_col in list(df.columns):

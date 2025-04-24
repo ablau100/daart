@@ -18,7 +18,98 @@ __all__ = [
     'run_lengths',
     'plot_training_curves',
     'load_metrics_csv_as_df',
+    'plot_train_val_curves'
 ]
+
+
+
+
+def plot_train_val_curves(
+        metrics_file: str,
+        expt_ids: Optional[list] = None,
+        save_file: Optional[str] = None,
+        format: str = 'png'
+) -> None:
+    """Create training plots showing both train and val metrics on the same graph."""
+    # List of metrics to plot
+    metrics_list = [
+        'loss', 'loss_weak', 'loss_strong', 'loss_pred', 'loss_task', 'loss_kl', 'fc'
+    ]
+    
+    # Load the metrics CSV file directly with pandas
+    df = pd.read_csv(metrics_file)
+    
+    # Set up the plot style
+    sns.set_style('white')
+    sns.set_context('talk')
+    
+    # Find which metrics exist in the data
+    available_metrics = []
+    for metric in metrics_list:
+        tr_col = f'tr_{metric}'
+        val_col = f'val_{metric}'
+        if tr_col in df.columns or val_col in df.columns:
+            available_metrics.append(metric)
+    
+    # Create figure with subplots for each loss type
+    n_metrics = len(available_metrics)
+    n_cols = min(2, n_metrics)
+    n_rows = (n_metrics + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(8*n_cols, 6*n_rows), squeeze=False)
+    axes = axes.flatten()
+    
+    # Plot each metric
+    for i, metric in enumerate(available_metrics):
+        ax = axes[i]
+        
+        # Get column names for this metric
+        tr_col = f'tr_{metric}'
+        val_col = f'val_{metric}'
+        
+        # Filter for aggregated data only (dataset=-1)
+        df_agg = df[df['dataset'] == -1]
+        
+        # Plot training data (filter out rows where there's no training data)
+        train_data = df_agg[df_agg[tr_col].notna()]
+        if not train_data.empty and tr_col in df.columns:
+            ax.plot(train_data['epoch'], train_data[tr_col], 'b-', 
+                   linewidth=2, label='Training')
+        
+        # Plot validation data (filter out rows where there's no validation data)
+        val_data = df_agg[df_agg[val_col].notna()]
+        if not val_data.empty and val_col in df.columns:
+            # For validation data, use both markers and lines
+            ax.plot(val_data['epoch'], val_data[val_col], 'r-', 
+                   linewidth=2, label='Validation')
+            ax.scatter(val_data['epoch'], val_data[val_col], 
+                      color='red', s=50, zorder=3)
+        
+        # Set labels and title
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(metric.capitalize())
+        ax.set_title(metric)
+        
+        # Only add legend to the first plot with data
+        if i == 0:
+            ax.legend()
+        
+        # Ensure x-axis starts at epoch 10 as in your example
+        if len(train_data) > 0:
+            ax.set_xlim(left=max(10, min(train_data['epoch'])))
+    
+    # Hide empty subplots
+    for i in range(len(available_metrics), len(axes)):
+        axes[i].axis('off')
+    
+    plt.tight_layout()
+    
+    # Save the figure
+    if save_file is not None:
+        make_dir_if_not_exists(save_file)
+        plt.savefig(save_file + '.' + format, dpi=300, format=format)
+    plt.close()
+
 
 
 @typechecked
@@ -189,6 +280,7 @@ def plot_training_curves(
 
     metrics_dfs = [load_metrics_csv_as_df(metrics_file, metrics_list, expt_ids=expt_ids)]
     metrics_df = pd.concat(metrics_dfs, sort=False)
+    print('metrics_df', metrics_df.columns, metrics_df)
 
     if isinstance(expt_ids, list) and len(expt_ids) > 1:
         hue = 'dataset'

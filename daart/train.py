@@ -9,7 +9,7 @@ from typing import Optional, Union
 from typeguard import typechecked
 import time
 import logging
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CyclicLR
 from daart.io import make_dir_if_not_exists
 
 # to ignore imports for sphix-autoapidoc
@@ -83,7 +83,8 @@ class Logger(object):
             self,
             dtype: str,
             loss_dict: dict,
-            dataset: Union[int, int, list, None] = None
+            dataset: Union[int, int, list, None] = None,
+            update_size: int = 1
     ) -> None:
         """Update metrics for a specific dtype/dataset.
 
@@ -98,7 +99,7 @@ class Logger(object):
             if NoneType, updates the aggregated metrics; if `int`, updates the associated dataset
 
         """
-        metrics = {**loss_dict, 'batches': 1}  # append `batches` to loss_dict
+        metrics = {**loss_dict, 'batches': update_size}  # append `batches` to loss_dict
 
         for key, val in metrics.items():
 
@@ -232,6 +233,18 @@ class Trainer(object):
             rng_seed_train: int = 0,
             save_last_model: bool = False,
             callbacks: list = [],
+            
+            ######### new code
+             # Add new scheduler parameters
+            lr_scheduler_type: str = None,  # 'plateau', 'cyclic', or None
+            lr_plateau_factor: float = 0.5,
+            lr_plateau_patience: int = 30,
+            lr_plateau_min: float = 1e-6,
+            lr_cyclic_min: float = None,
+            lr_cyclic_max: float = None,
+            lr_cyclic_step_up: int = 50,
+            lr_cyclic_step_down: int = 100,
+
             **kwargs
     ) -> None:
         """Initialize trainer object with hyperparameters.
@@ -273,7 +286,21 @@ class Trainer(object):
         self.should_halt = False
         
         # batch transforms
-        self.batch_transforms = kwargs['batch_transforms']
+        self.batch_transforms = kwargs.get('batch_transforms', None)
+        
+        
+        #### new code
+        # Store new scheduler parameters
+        self.lr_scheduler_type = lr_scheduler_type
+        self.lr_plateau_factor = lr_plateau_factor
+        self.lr_plateau_patience = lr_plateau_patience
+        self.lr_plateau_min = lr_plateau_min
+
+        # Set default cyclic values if not provided
+        self.lr_cyclic_min = lr_cyclic_min if lr_cyclic_min is not None else learning_rate/10
+        self.lr_cyclic_max = lr_cyclic_max if lr_cyclic_max is not None else learning_rate
+        self.lr_cyclic_step_up = lr_cyclic_step_up
+        self.lr_cyclic_step_down = lr_cyclic_step_down
 
     def fit(self, model, data_generator, save_path):
         """Fit pytorch models with stochastic gradient descent and early stopping.
@@ -319,6 +346,33 @@ class Trainer(object):
         optimizer = torch.optim.Adam(
             model.get_parameters(), lr=self.learning_rate, weight_decay=self.l2_reg, amsgrad=True)
 
+        
+        
+        ##### new code
+        # Set up learning rate scheduler
+        scheduler = None
+        if self.lr_scheduler_type == 'plateau':
+            scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=self.lr_plateau_factor,
+            patience=self.lr_plateau_patience,
+            verbose=True,
+            threshold=0.001,
+            min_lr=self.lr_plateau_min
+            )
+        elif self.lr_scheduler_type == 'cyclic':
+            scheduler = CyclicLR(
+            optimizer,
+            base_lr=self.lr_cyclic_min,
+            max_lr=self.lr_cyclic_max,
+            step_size_up=self.lr_cyclic_step_up,
+            step_size_down=self.lr_cyclic_step_down,
+            mode='triangular2',
+            cycle_momentum=False
+            )
+        
+        
         # logging setup
         logger = Logger(n_datasets=data_generator.n_datasets, save_path=save_path)
 
@@ -374,14 +428,18 @@ class Trainer(object):
 
                 # get next minibatch and put it on the device
                 data, datasets = data_generator.next_batch('train',transforms=self.batch_transforms)
-
                 # call the appropriate loss function
                 loss_dict = model.training_step(data, accumulate_grad=True)
-                logger.update_metrics('train', loss_dict, dataset=datasets)
+                logger.update_metrics('train', loss_dict, dataset=datasets, update_size=data['markers'].shape[0])
 
                 # step (evaluate untrained network on epoch 0)
                 if i_epoch > 0:
                     optimizer.step()
+                    
+                    ### new code
+                    # Step cyclic scheduler if being used (after each batch)
+                    if scheduler is not None and self.lr_scheduler_type == 'cyclic':
+                        scheduler.step()
 
                 # --------------------------------------
                 # check validation according to schedule
@@ -395,28 +453,44 @@ class Trainer(object):
                     for i_val in range(data_generator.n_tot_batches['val']):
                         # get next minibatch and put it on the device
                         data, datasets = data_generator.next_batch('val')
-
                         # call the appropriate loss function
                         loss_dict = model.training_step(data, accumulate_grad=False)
-                        logger.update_metrics('val', loss_dict, dataset=datasets)
+                        logger.update_metrics('val', loss_dict, dataset=datasets, update_size=data['markers'].shape[0])
+                        
+                    ##### new code
+                    # Get current validation loss
+                    current_val_loss = logger.get_loss('val')
+                    
+                    # Step plateau scheduler if being used
+                    if scheduler is not None and self.lr_scheduler_type == 'plateau':
+                        scheduler.step(current_val_loss)
+                    
+                    # Log current learning rate
+                    current_lr = optimizer.param_groups[0]['lr']
+                    print(f"Epoch {i_epoch}, Batch {i_batch}, LR: {current_lr:.6f}")
+                    logging.info(f"Epoch {i_epoch}, Batch {i_batch}, LR: {current_lr:.6f}")
+                    ####
 
-                    # save best val model
-                    # if logger.get_loss('val') < best_val_loss:
-                    #     best_val_loss = logger.get_loss('val')
-                    #     model.save(os.path.join(save_path, 'best_val_model.pt'))
-                    #     best_model_saved = True
-                    #     best_val_epoch = i_epoch
 
-                    # # export aggregated metrics on val data
-                    # logger.create_metric_row(
-                    #     dtype='val', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
-                    #     by_dataset=False, best_epoch=best_val_epoch)
-                    # # export individual dataset metrics on val data if possible
-                    # if data_generator.n_datasets > 1:
-                    #     for dataset in range(data_generator.n_datasets):
-                    #         logger.create_metric_row(
-                    #             dtype='val', epoch=i_epoch, batch=i_batch, dataset=dataset,
-                    #             trial=-1, by_dataset=True, best_epoch=best_val_epoch)
+                    #save best val model
+                    if logger.get_loss('val') < best_val_loss:
+                        best_val_loss = logger.get_loss('val')
+                        model.save(os.path.join(save_path, 'best_val_model.pt'))
+                        best_model_saved = True
+                        best_val_epoch = i_epoch
+                        print(f"Best epoch: {best_val_epoch}, val loss: {logger.get_loss('val'):.4f}")
+                        logging.info(f"Best epoch: {best_val_epoch}, val loss: {logger.get_loss('val'):.4f}")
+
+                    # export aggregated metrics on val data
+                    logger.create_metric_row(
+                        dtype='val', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
+                        by_dataset=False, best_epoch=best_val_epoch)
+                    # export individual dataset metrics on val data if possible
+                    if data_generator.n_datasets > 1:
+                        for dataset in range(data_generator.n_datasets):
+                            logger.create_metric_row(
+                                dtype='val', epoch=i_epoch, batch=i_batch, dataset=dataset,
+                                trial=-1, by_dataset=True, best_epoch=best_val_epoch)
 
             # ---------------------------------------
             # export training metrics at end of epoch
@@ -451,9 +525,6 @@ class Trainer(object):
         # Calculate the time taken
         elapsed_time = end_time - start_time
         logging.info(f"The for loop took {elapsed_time:.6f} seconds to complete.")
-
-        print(f"The for loop took {elapsed_time:.6f} seconds to complete.")
-        
         
 
         # ---------------------------------------
@@ -494,4 +565,5 @@ class Trainer(object):
         if save_path is not None:
             from daart.io import export_hparams
             model.hparams['best_val_epoch'] = best_val_epoch
+            logging.info(f"The best epoch is {best_val_epoch}.")
             export_hparams(model.hparams, filename=os.path.join(save_path, 'hparams.yaml'))
