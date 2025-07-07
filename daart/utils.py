@@ -2,10 +2,11 @@
 
 import logging
 import os
-
+import torch
 from daart.data import compute_sequence_pad, DataGenerator
 from daart.transforms import ZScore
-from daart.data_streaming import StreamingSingleDataset
+from daart.data_dali import FrameLabelLoader, build_dali_data_loader
+from daart.beast_utils.dataset_utils import load_all_labels
 
 
 # to ignore imports for sphix-autoapidoc
@@ -14,82 +15,48 @@ __all__ = ['build_data_generator', 'collect_callbacks']
 
 def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
     """Helper function to build a data generator from hparam dict."""
+    
+    if dtype == 'train':
+        expt_ids = hparams['expt_ids']
+        inference = False
+    else:
+        expt_ids = hparams['expt_ids_test']
+        inference = True
+        
+    if hparams.get('input_type') == 'transformer':
+        hparams['input_size'] = 768
+        video_dir = hparams['video_dir']
+        label_dir = os.path.join(hparams['data_dir'], 'labels-hand')
+        save_dir = os.path.join(hparams['data_dir'], 'dali_seq')
+        pad = compute_sequence_pad(hparams)
+        hparams['pad'] = pad
+        
+         # 1) Build the DALI-based loader 
+        dali_loader = build_dali_data_loader(
+            dtype, expt_ids, video_dir, label_dir,
+            save_dir, hparams, device_id=0, world_size=1, pad=pad
+        )
+        # 2) Pre-load the labels once
+        all_lbl = load_all_labels(
+            f"{save_dir}/labels_list_{dtype}.txt",
+            sequence_length=hparams["sequence_length"],
+            pad=pad
+        )
+        device_id = 0
+        all_lbl = torch.tensor(all_lbl).to(f"cuda:{device_id}")
+    
+        # 3) Wrap and return our FrameLabelLoader
+        FrameLabelLoader.n_datasets = len(expt_ids)
+        vit_cfg_path = hparams['transformer_config']
+        device = hparams['device']
+        batch_size = hparams['batch_size']
+        return FrameLabelLoader(dali_loader, all_lbl, pad, vit_cfg_path, device, batch_size, eids=expt_ids)
+        
+
     signals = []
     transforms = []
     paths = []
-    if dtype == 'train':
-        expt_ids = hparams['expt_ids']
-    else:
-        expt_ids = hparams['expt_ids_test']
-        
-    # ───────────── Transformer branch ─────────────
-    # Insert this *before* the stock generator logic:
-    signals    = []
-    transforms = []
-    paths      = []
 
-    if hparams.get('input_type') == 'transformer':
-        for expt_id in expt_ids:
-            signals_curr    = []
-            transforms_curr = []
-            paths_curr      = []
-
-            # ── 1) features (video) ────────────────────────────────────────
-            base_dir   = hparams['video_dir']
-            possible_vids = [
-                os.path.join(base_dir, f"{expt_id}{ext}")
-                for ext in (".mp4", ".avi", ".mov")
-            ]
-            video_file = next((p for p in possible_vids if os.path.exists(p)), None)
-            if video_file is None:
-                raise FileNotFoundError(f"Video not found for {expt_id} in {base_dir}")
-
-            signals_curr.append('markers')
-            transforms_curr.append(None)
-            paths_curr.append(video_file)
-
-            # ── 2) hand labels ─────────────────────────────────────────────
-            if hparams.get('lambda_strong', 0) > 0:
-                lbl_dir = os.path.join(hparams['data_dir'], 'labels-hand')
-                possible_lbls = [
-                    os.path.join(lbl_dir, f"{expt_id}_labels.csv"),
-                    os.path.join(lbl_dir, f"{expt_id}.csv"),
-                ]
-                hand_file = next((p for p in possible_lbls if os.path.exists(p)), None)
-                if hand_file is None and hparams.get('train_frac',1.0) == 1.0:
-                    logging.warning(f"No hand-label CSV for {expt_id} in {lbl_dir}")
-
-                signals_curr.append('labels_strong')
-                transforms_curr.append(None)
-                paths_curr.append(hand_file)
-
-            # ── 3) collect this session ────────────────────────────────────
-            signals.append(signals_curr)
-            transforms.append(transforms_curr)
-            paths.append(paths_curr)
-
-        # ── after loop, build your DataGenerator ────────────────────────
-        hparams['sequence_pad'] = 0  # or compute_sequence_pad(hparams)
-        data_gen = DataGenerator(
-            ids_list           = hparams['expt_ids'],
-            signals_list       = signals,
-            transforms_list    = transforms,
-            paths_list         = paths,
-            device             = hparams['device'],
-            sequence_length    = hparams['sequence_length'],
-            sequence_pad       = hparams['sequence_pad'],
-            batch_size         = hparams['batch_size'],
-            trial_splits       = hparams['trial_splits'],
-            train_frac         = hparams['train_frac'],
-            input_type         = 'transformer',
-            dataset_class      = StreamingSingleDataset,
-            transformer_config = hparams['transformer_config'],
-            transformer_ckpt   = hparams['transformer_ckpt']
-        )
-
-        hparams['output_size'] = len(data_gen.label_names)
-        return data_gen
-    
     # old code for other feature types
     signals = []
     transforms = []
@@ -245,7 +212,8 @@ def build_data_generator(hparams: dict, dtype='train') -> DataGenerator:
         train_frac=hparams['train_frac'],
         input_type=hparams.get('input_type', 'markers'),
         batch_transform_params=hparams.get('batch_transform_params', {}),
-        batch_transforms=hparams.get('batch_transforms', [])
+        batch_transforms=hparams.get('batch_transforms', []),
+        inference = inference
     )
 
     # automatically compute input/output sizes from data

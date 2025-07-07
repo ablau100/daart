@@ -23,6 +23,7 @@ from torch.utils import data
 from torch.utils.data import SubsetRandomSampler
 from typing import List, Union
 from typeguard import typechecked
+from concurrent.futures import ThreadPoolExecutor
 
 
 __all__ = [
@@ -224,7 +225,10 @@ class SingleDataset(data.Dataset):
             batch_transforms = [],
             transformer_config="",
             transformer_ckpt="",
-            max_imgs_per_pass = 1024
+            max_imgs_per_pass = 1024,
+            inference = False,
+            video_dir = None,
+            expt_ids=None
     ) -> None:
         """
 
@@ -256,7 +260,9 @@ class SingleDataset(data.Dataset):
 
         # specify data
         self.id = id
-
+        self.video_dir = video_dir
+        self.inference = inference
+        self.expt_ids=expt_ids
         # get data paths
         self.signals = signals
         self.transforms = OrderedDict()
@@ -305,7 +311,7 @@ class SingleDataset(data.Dataset):
         return self.n_sequences
 
     @typechecked
-    def __getitem__(self, idx: Union[int, np.int64, None]) -> dict:
+    def __getitem__(self, idx: Union[int, np.int64, None]) -> Union[dict, bool]:
         """Return batch of data.
 
         Parameters
@@ -319,7 +325,9 @@ class SingleDataset(data.Dataset):
             data sample
 
         """
-
+        labels_seq = self.data['labels_strong'][idx]
+        #if (not self.inference) and (labels_seq.sum() == 0):
+         #   return False
         sample = OrderedDict()
         for signal in self.signals:
 
@@ -335,7 +343,7 @@ class SingleDataset(data.Dataset):
                     sample[signal] = torch.from_numpy(sample[signal][0]).float()
                 else:
                     sample[signal] = torch.from_numpy(sample[signal][0]).long()
-            
+            #print('x shape og ', signal, sample[signal].shape)
             if signal == 'markers':
                 # add data augment transforms
                 #########################
@@ -388,8 +396,9 @@ class SingleDataset(data.Dataset):
                     if 'velocity' in self.batch_transforms:
                         velocity = np.vstack([np.zeros_like(sample[signal][0]), np.diff(sample[signal], axis=0)])
                         velocity = (velocity - self.v_mean) / self.v_std
+                        #print('pre shape', sample[signal].shape)
                         sample[signal] = torch.tensor(np.hstack([sample[signal], velocity]), dtype=torch.float32)
-                        
+                        #print('post shape', sample[signal].shape)
                
 
                 ########################
@@ -596,6 +605,9 @@ class DataGenerator(object):
             transformer_config="",
             transformer_ckpt="",
             dataset_class=SingleDataset,
+            inference = False,
+            video_dir = None,
+            expt_ids = None
     ) -> None:
         """
 
@@ -642,6 +654,7 @@ class DataGenerator(object):
         self.batch_size = batch_size
         self.as_numpy = as_numpy
         self.device = device
+        self.inference = inference
         self.datasets = []
         self.signals = signals_list
         self.transforms = transforms_list
@@ -653,7 +666,8 @@ class DataGenerator(object):
                 as_numpy=self.as_numpy, sequence_length=sequence_length,
                 sequence_pad=sequence_pad, input_type=input_type,
                 batch_transform_params = batch_transform_params, batch_transforms=batch_transforms,
-                transformer_config=transformer_config,transformer_ckpt=transformer_ckpt
+                transformer_config=transformer_config,transformer_ckpt=transformer_ckpt, inference=inference,
+                video_dir = video_dir, expt_ids=expt_ids
             ))
 
         # collect info about datasets
@@ -742,6 +756,8 @@ class DataGenerator(object):
     def __len__(self) -> int:
         return self.n_datasets
 
+    
+    
     @typechecked
     def count_class_examples(self) -> np.array:
 
@@ -779,79 +795,166 @@ class DataGenerator(object):
             else:
                 self.dataset_iters[i][dtype] = iter(self.dataset_loaders[i][dtype])
 
+                
+
+
+    from concurrent.futures import ThreadPoolExecutor
+
     @typechecked
-    def next_batch(self, dtype: str, transforms: Union[iter, None]=None) -> tuple:
-        """Return next batch of data.
+    def next_batch(self, dtype: str, transforms: Union[iter, None] = None) -> tuple:
+        """Return next batch of data, using multiple GPUs if available, and filter invalid sequences."""
 
-        The data generator iterates randomly through datasets and trials. Once a dataset runs out
-        of trials it is skipped.
-
-        Parameters
-        ----------
-        dtype : str
-            'train' | 'val' | 'test'
-
-        Returns
-        -------
-        tuple
-            - sample (dict): data batch with keys given by `signals` input to class
-            - dataset (int): dataset from which data batch is drawn
-
-        """
         empty_datasets = np.zeros(self.n_datasets)
 
-        # automatically set val/test batch sizes to 1 for more fine-grained logging
         n_batches = self.batch_size if dtype == 'train' else 1
-
         n_sequences = 0
         sequences = []
         datasets = []
 
         while True:
-
-            # get next dataset
-            dataset = np.random.choice(np.arange(self.n_datasets), p=self.batch_ratios)
-
-            # get sequence from this dataset
+            dataset_idx = np.random.choice(np.arange(self.n_datasets), p=self.batch_ratios)
             try:
-                sequence = next(self.dataset_iters[dataset][dtype])
-                # add sequence to batch
-                sequences.append(sequence)
-                datasets.append(dataset)
+                sequence = next(self.dataset_iters[dataset_idx][dtype])
+                if not sequence:  # covers False and empty sequences
+                    continue
+                sequences.append((dataset_idx, sequence))
+                datasets.append(dataset_idx)
                 n_sequences += 1
-                # exit loop if we have enough batches
                 if n_sequences == n_batches:
                     break
             except StopIteration:
-                # record dataset as being empty
-                empty_datasets[dataset] = 1
-                # leave loop if all datasets are empty; otherwise, continue collecting sequences
+                empty_datasets[dataset_idx] = 1
                 if np.all(empty_datasets):
                     break
-                else:
-                    continue
+                continue
 
+        if len(sequences) < 1:
+            return False, False
+
+        # Check how many GPUs available
+        n_gpus = torch.cuda.device_count()
+
+        # Helper to load one sequence
+        def load_one(seq_info, device_id):
+            dataset_idx, sequence = seq_info
+            torch.cuda.set_device(device_id)
+            return sequence  # return the sequence directly
+
+        # Load sequences in parallel if multiple GPUs
+        if n_gpus > 1:
+            futures = []
+            with ThreadPoolExecutor(max_workers=min(len(sequences), n_gpus)) as executor:
+                for i, seq_info in enumerate(sequences):
+                    device_id = i % n_gpus
+                    futures.append(executor.submit(load_one, seq_info, device_id))
+                loaded_sequences = [f.result() for f in futures]
+        else:
+            loaded_sequences = [s for (d, s) in sequences]
+
+        # 🚨 FILTER: Remove any False or invalid sequences
+        loaded_sequences = [s for s in loaded_sequences if s and isinstance(s, dict)]
+
+        if len(loaded_sequences) < 1:
+            return False, False
+
+        # Build batch
         batch = OrderedDict()
         if self.as_numpy:
-            for i, signal in enumerate(sequences[0]):
+            for signal in loaded_sequences[0]:
                 if signal != 'batch_idx':
                     batch[signal] = np.row_stack(
-                        [s[signal].cpu().detach().numpy() for s in sequences])
+                        [s[signal].cpu().detach().numpy() for s in loaded_sequences]
+                    )
                 else:
-                    batch['batch_idx'] = [ss['batch_idx'] for ss in sequences]
+                    batch['batch_idx'] = [s['batch_idx'] for s in loaded_sequences]
         else:
-            for i, signal in enumerate(sequences[0]):
+            for signal in loaded_sequences[0]:
                 if signal != 'batch_idx':
-                    batch[signal] = torch.vstack([s[signal] for s in sequences])
+                    batch[signal] = torch.vstack([s[signal] for s in loaded_sequences])
                 else:
-                    batch['batch_idx'] = torch.vstack([s['batch_idx'] for s in sequences])
+                    batch['batch_idx'] = torch.vstack([s['batch_idx'] for s in loaded_sequences])
 
             if self.device == 'cuda':
                 batch = {key: val.to('cuda') for key, val in batch.items()}
 
-        return batch, datasets   
-    
+        return batch, datasets
 
+                
+#     @typechecked
+#     def next_batch(self, dtype: str, transforms: Union[iter, None]=None) -> tuple:
+#         """Return next batch of data.
+
+#         The data generator iterates randomly through datasets and trials. Once a dataset runs out
+#         of trials it is skipped.
+
+#         Parameters
+#         ----------
+#         dtype : str
+#             'train' | 'val' | 'test'
+
+#         Returns
+#         -------
+#         tuple
+#             - sample (dict): data batch with keys given by `signals` input to class
+#             - dataset (int): dataset from which data batch is drawn
+
+#         """
+#         empty_datasets = np.zeros(self.n_datasets)
+
+#         # automatically set val/test batch sizes to 1 for more fine-grained logging
+#         n_batches = self.batch_size if dtype == 'train' else 1
+
+#         n_sequences = 0
+#         sequences = []
+#         datasets = []
+
+#         while True:
+
+#             # get next dataset
+#             dataset = np.random.choice(np.arange(self.n_datasets), p=self.batch_ratios)
+
+#             # get sequence from this dataset
+#             try:
+#                 sequence = next(self.dataset_iters[dataset][dtype])
+#                 if not sequence:
+#                     continue
+#                 # add sequence to batch
+#                 sequences.append(sequence)
+#                 datasets.append(dataset)
+#                 n_sequences += 1
+#                 # exit loop if we have enough batches
+#                 if n_sequences == n_batches:
+#                     break
+#             except StopIteration:
+#                 # record dataset as being empty
+#                 empty_datasets[dataset] = 1
+#                 # leave loop if all datasets are empty; otherwise, continue collecting sequences
+#                 if np.all(empty_datasets):
+#                     break
+#                 else:
+#                     continue
+#         if len(sequences) < 1:
+#             return False,False
+#         batch = OrderedDict()
+#         if self.as_numpy:
+#             for i, signal in enumerate(sequences[0]):
+#                 if signal != 'batch_idx':
+#                     batch[signal] = np.row_stack(
+#                         [s[signal].cpu().detach().numpy() for s in sequences])
+#                 else:
+#                     batch['batch_idx'] = [ss['batch_idx'] for ss in sequences]
+#         else:
+#             for i, signal in enumerate(sequences[0]):
+#                 if signal != 'batch_idx':
+#                     batch[signal] = torch.vstack([s[signal] for s in sequences])
+#                 else:
+#                     batch['batch_idx'] = torch.vstack([s['batch_idx'] for s in sequences])
+
+#             if self.device == 'cuda':
+#                 batch = {key: val.to('cuda') for key, val in batch.items()}
+
+#         return batch, datasets   
+    
 def rotate(p, origin=(0, 0), degrees=0):
     angle = np.deg2rad(degrees)
     R = np.array([[np.cos(angle), -np.sin(angle)],

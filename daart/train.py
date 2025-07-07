@@ -83,7 +83,7 @@ class Logger(object):
             self,
             dtype: str,
             loss_dict: dict,
-            dataset: Union[int, int, list, None] = None,
+            dataset: Union[int, int, list, None, str] = None,
             update_size: int = 1
     ) -> None:
         """Update metrics for a specific dtype/dataset.
@@ -102,7 +102,8 @@ class Logger(object):
         metrics = {**loss_dict, 'batches': update_size}  # append `batches` to loss_dict
 
         for key, val in metrics.items():
-
+            if key == 'f1' and np.isnan(val):
+                continue
             # define metric for the first time if necessary
             if key not in self.metrics[dtype]:
                 self.metrics[dtype][key] = 0
@@ -240,8 +241,8 @@ class Trainer(object):
             lr_plateau_factor: float = 0.5,
             lr_plateau_patience: int = 30,
             lr_plateau_min: float = 1e-6,
-            lr_cyclic_min: float = None,
-            lr_cyclic_max: float = None,
+            lr_cyclic_min: float = 0,
+            lr_cyclic_max: float = 0,
             lr_cyclic_step_up: int = 50,
             lr_cyclic_step_down: int = 100,
 
@@ -379,14 +380,19 @@ class Trainer(object):
         # enumerate batches on which validation metrics should be recorded
         best_model_saved = False
         best_val_loss = np.inf
+        best_val_f1 = -np.inf
         best_val_epoch = None
-        n_train_batches = data_generator.n_tot_batches['train']
-        self.val_check_batch = np.append(
-            self.val_check_interval * n_train_batches *
-            np.arange(1, int((self.max_epochs + 1) / self.val_check_interval)),
-            [n_train_batches * self.max_epochs,
-             n_train_batches * (self.max_epochs + 1)]).astype('int')
-
+        # n_train_batches = data_generator.n_tot_batches['train']
+        # self.val_check_batch = np.append(
+        #     self.val_check_interval * n_train_batches *
+        #     np.arange(1, int((self.max_epochs + 1) / self.val_check_interval)),
+        #     [n_train_batches * self.max_epochs,
+        #      n_train_batches * (self.max_epochs + 1)]).astype('int')
+        self.val_check_epoch = np.arange(0, self.max_epochs + 1, self.val_check_interval)[1:]
+        # print('n_train_batches', n_train_batches)
+        print('self.val_check_batch', self.val_check_batch)
+        print('self.val_check_epoch', self.val_check_epoch)
+        
         # set random seeds for training
         torch.manual_seed(self.rng_seed_train)
         np.random.seed(self.rng_seed_train)
@@ -411,6 +417,7 @@ class Trainer(object):
             data_generator.reset_iterators('train')
 
             i_batch = 0
+            print('n batch', data_generator.n_tot_batches['train'])
             for i_batch in range(data_generator.n_tot_batches['train']):
 
                 if i_epoch > 0:
@@ -428,6 +435,9 @@ class Trainer(object):
 
                 # get next minibatch and put it on the device
                 data, datasets = data_generator.next_batch('train',transforms=self.batch_transforms)
+                # print('data')
+                # for k,v in data.items():
+                #     print(k, v.shape)
                 # call the appropriate loss function
                 loss_dict = model.training_step(data, accumulate_grad=True)
                 logger.update_metrics('train', loss_dict, dataset=datasets, update_size=data['markers'].shape[0])
@@ -441,56 +451,68 @@ class Trainer(object):
                     if scheduler is not None and self.lr_scheduler_type == 'cyclic':
                         scheduler.step()
 
-                # --------------------------------------
-                # check validation according to schedule
-                # --------------------------------------
-                if np.any(self.curr_batch == self.val_check_batch):
+            # --------------------------------------
+            # check validation according to schedule
+            # --------------------------------------
+           
+            if np.any(self.curr_epoch == self.val_check_epoch):
 
-                    logger.reset_metrics('val')
-                    data_generator.reset_iterators('val')
-                    model.eval()
+                logger.reset_metrics('val')
+                data_generator.reset_iterators('val')
+                model.eval()
 
-                    for i_val in range(data_generator.n_tot_batches['val']):
-                        # get next minibatch and put it on the device
-                        data, datasets = data_generator.next_batch('val')
-                        # call the appropriate loss function
-                        loss_dict = model.training_step(data, accumulate_grad=False)
-                        logger.update_metrics('val', loss_dict, dataset=datasets, update_size=data['markers'].shape[0])
-                        
-                    ##### new code
-                    # Get current validation loss
-                    current_val_loss = logger.get_loss('val')
-                    
-                    # Step plateau scheduler if being used
-                    if scheduler is not None and self.lr_scheduler_type == 'plateau':
-                        scheduler.step(current_val_loss)
-                    
-                    # Log current learning rate
-                    current_lr = optimizer.param_groups[0]['lr']
-                    print(f"Epoch {i_epoch}, Batch {i_batch}, LR: {current_lr:.6f}")
-                    logging.info(f"Epoch {i_epoch}, Batch {i_batch}, LR: {current_lr:.6f}")
-                    ####
+                for i_val in range(data_generator.n_tot_batches['val']):
+                    # get next minibatch and put it on the device
+                    data, datasets = data_generator.next_batch('val')
+                    # call the appropriate loss function
+                    loss_dict = model.training_step(data, accumulate_grad=False)
+                    #print('f1', loss_dict['f1'])
+                    logger.update_metrics('val', loss_dict, dataset=datasets, update_size=data['markers'].shape[0])
 
+                ##### new code
+                # Get current validation loss
+                current_val_loss = logger.get_loss('val')
 
-                    #save best val model
-                    if logger.get_loss('val') < best_val_loss:
-                        best_val_loss = logger.get_loss('val')
-                        model.save(os.path.join(save_path, 'best_val_model.pt'))
-                        best_model_saved = True
-                        best_val_epoch = i_epoch
-                        print(f"Best epoch: {best_val_epoch}, val loss: {logger.get_loss('val'):.4f}")
-                        logging.info(f"Best epoch: {best_val_epoch}, val loss: {logger.get_loss('val'):.4f}")
+                # Step plateau scheduler if being used
+                if scheduler is not None and self.lr_scheduler_type == 'plateau':
+                    scheduler.step(current_val_loss)
 
-                    # export aggregated metrics on val data
-                    logger.create_metric_row(
-                        dtype='val', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
-                        by_dataset=False, best_epoch=best_val_epoch)
-                    # export individual dataset metrics on val data if possible
-                    if data_generator.n_datasets > 1:
-                        for dataset in range(data_generator.n_datasets):
-                            logger.create_metric_row(
-                                dtype='val', epoch=i_epoch, batch=i_batch, dataset=dataset,
-                                trial=-1, by_dataset=True, best_epoch=best_val_epoch)
+                # Log current learning rate
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Epoch {i_epoch}, Batch {i_batch}, LR: {current_lr:.6f}")
+                logging.info(f"Epoch {i_epoch}, Batch {i_batch}, LR: {current_lr:.6f}")
+                ####
+
+                val_batches = logger.metrics['val']['batches']
+                current_val_f1 = logger.metrics['val'].get('f1', 0) / val_batches
+                print(f"Current epoch: {i_epoch}, val F1: {current_val_f1:.4f}")
+                logging.info(f"Current epoch: {i_epoch}, val F1: {current_val_f1:.4f}")
+                if current_val_f1 > best_val_f1:
+                    best_val_f1 = current_val_f1
+                    model.save(os.path.join(save_path, 'best_val_model.pt'))
+                    best_model_saved = True
+                    best_val_epoch = i_epoch
+                    print(f"Best epoch: {best_val_epoch}, val F1: {best_val_f1:.4f}")
+                    logging.info(f"Best epoch: {best_val_epoch}, val F1: {best_val_f1:.4f}")
+                # #save best val model
+                # if logger.get_loss('val') < best_val_loss:
+                #     best_val_loss = logger.get_loss('val')
+                #     model.save(os.path.join(save_path, 'best_val_model.pt'))
+                #     best_model_saved = True
+                #     best_val_epoch = i_epoch
+                #     print(f"Best epoch: {best_val_epoch}, val loss: {logger.get_loss('val'):.4f}")
+                #     logging.info(f"Best epoch: {best_val_epoch}, val loss: {logger.get_loss('val'):.4f}")
+
+                # export aggregated metrics on val data
+                logger.create_metric_row(
+                    dtype='val', epoch=i_epoch, batch=i_batch, dataset=-1, trial=-1,
+                    by_dataset=False, best_epoch=best_val_epoch)
+                # export individual dataset metrics on val data if possible
+                if data_generator.n_datasets > 1:
+                    for dataset in range(data_generator.n_datasets):
+                        logger.create_metric_row(
+                            dtype='val', epoch=i_epoch, batch=i_batch, dataset=dataset,
+                            trial=-1, by_dataset=True, best_epoch=best_val_epoch)
 
             # ---------------------------------------
             # export training metrics at end of epoch

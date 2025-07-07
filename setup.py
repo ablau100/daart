@@ -1,5 +1,5 @@
-from distutils.core import setup
-
+#from distutils.core import setup
+from setuptools import setup, find_packages
 
 VERSION = '1.1.0'
 
@@ -39,7 +39,7 @@ extras_require = {
 
 setup(
     name='daart',
-    packages=['daart'],
+    packages=find_packages(),
     version=VERSION,
     description='a collection of action segmentation tools for analyzing behavioral data',
     long_description=long_description,

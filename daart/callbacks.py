@@ -45,13 +45,20 @@ class EarlyStopping(BaseCallback):
         self.best_loss = np.inf
 
     def on_epoch_end(self, data_generator, model, trainer, logger=None, **kwargs):
-
-        # skip if this is not a validation epoch
-        if not np.any(trainer.curr_batch == trainer.val_check_batch):
+        # print("early stopping callback triggered")
+        # # skip if this is not a validation epoch
+        # print('trainer.curr_epoch', trainer.curr_epoch)
+        # print('trainer.val_check_epoch', trainer.val_check_epoch)
+        # print("trainer.val_check_interval", trainer.val_check_interval)
+        # print("trainer.curr_epoch % trainer.val_check_interval", trainer.curr_epoch % trainer.val_check_interval)
+        if not np.any(trainer.curr_epoch == trainer.val_check_epoch):
+            #print('bye')
+        #if not (trainer.curr_epoch % trainer.val_check_interval == 0):
             return
 
         # use overall validation loss for early stopping
         loss = logger.get_loss('val')
+        print('val loss in cb', loss)
 
         # update best loss and epoch that it occurred
         if loss < self.best_loss - self.delta:
